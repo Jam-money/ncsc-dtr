@@ -1,0 +1,25 @@
+project_id = "ncsc-dtr-local"
+
+[api]
+port = 56321
+
+[db]
+port = 56322
+shadow_port = 56320
+
+[studio]
+port = 56323
+
+[local_smtp]
+port = 56324
+
+[analytics]
+enabled = false
+
+[auth]
+minimum_password_length = 8
+site_url = "http://localhost:3000"
+additional_redirect_urls = ["http://localhost:3000/reset-password", "http://localhost:3000/reset-password?flow=recovery"]
+
+[auth.email]
+enable_confirmations = true

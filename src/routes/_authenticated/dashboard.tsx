@@ -1,0 +1,2746 @@
+import { TravelOut, TravelDetails } from "@/components/travel-out";
+import { SecurityMonitor } from "@/components/security-monitor";
+import { AdminReports } from "@/components/admin-reports";
+import { AdminWorkspace } from "@/components/admin-workspace";
+import { AttendanceCalendar } from "@/components/attendance-calendar";
+import { CheckoutCelebration } from "@/components/checkout-celebration";
+import { AttendanceEmpty, AttendanceLoading } from "@/components/attendance-states";
+import { Check, Clock3 } from "lucide-react";
+import { roleReportText } from "@/lib/attendance-reports.mjs";
+import {
+  ChiefApproval,
+  ChiefSettings,
+  DtrEditor,
+  type EditableDtr,
+} from "@/components/chief-approval";
+import type { ChiefRequest } from "@/lib/chief-input";
+import {
+  accountLabels,
+  supportedAccountLabels,
+  accountProgress,
+  currentProcessingContract,
+  type ProcessingContract,
+} from "@/lib/account-progress.mjs";
+import { ProcessingContracts } from "@/components/processing-contracts";
+import { AccountProfileSummary, AccountProgressSummary } from "@/components/account-summary";
+import type { Enums } from "@/integrations/supabase/types";
+import { CreateAccountForm } from "@/components/create-account-form";
+import { createFileRoute, Link, useNavigate } from "@tanstack/react-router";
+import { useEffect, useMemo, useRef, useState } from "react";
+import { supabase } from "@/integrations/supabase/client";
+import { type CreatedTraineeProfile } from "@/lib/admin-account.functions";
+import {
+  AlertDialog,
+  AlertDialogContent,
+  AlertDialogHeader,
+  AlertDialogTitle,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogCancel,
+} from "@/components/ui/alert-dialog";
+import { calculateCompletedHours as computeHours } from "@/lib/ojt-progress.mjs";
+import ncscLogo from "../../../assets/ncsc-logo.png";
+import { loadDtrRows, loadProfiles } from "@/lib/dtr-data";
+import {
+  ATTENDANCE_TIME_ZONE,
+  attendanceDate,
+  attendanceMonth,
+  attendanceYear,
+} from "@/lib/dtr-time";
+
+export const Route = createFileRoute("/_authenticated/dashboard")({
+  head: () => ({
+    meta: [
+      { title: "My DTR · NCSC Attendance" },
+      {
+        name: "description",
+        content:
+          "Punch in, break out, break in, and check out. Your daily time record is saved to your account.",
+      },
+    ],
+  }),
+  component: DashboardPage,
+});
+
+type Punch = "check_in" | "break_out" | "break_in" | "check_out";
+
+type DtrRow = {
+  travel_hours?: number | null;
+  travel_place?: string | null;
+  travel_reason?: string | null;
+  id?: string;
+  user_id?: string;
+  entry_date: string;
+  check_in: string | null;
+  break_out: string | null;
+  break_in: string | null;
+  check_out: string | null;
+};
+
+type DtrReportProfile = {
+  processingContracts?: ProcessingContract[];
+  fullName: string;
+  ojtTitle: string | null;
+  accountType: Enums<"account_type">;
+  requiredOjtHours: number | null;
+  requiredWorkdays: number | null;
+};
+
+type Profile = {
+  processing_contracts?: ProcessingContract[];
+  account_type: Enums<"account_type">;
+  required_workdays: number | null;
+  updated_at: string;
+  full_name: string | null;
+  student_id: string | null;
+  company: string | null;
+  ojt_title: string | null;
+  required_ojt_hours: number | null;
+  is_active: boolean;
+  is_admin?: boolean;
+};
+
+type TraineeRow = {
+  processing_contracts?: ProcessingContract[];
+  account_type: Enums<"account_type">;
+  required_workdays: number | null;
+  updated_at: string;
+  id: string;
+  full_name: string | null;
+  student_id: string | null;
+  company: string | null;
+  ojt_title: string | null;
+  required_ojt_hours: number | null;
+  is_admin: boolean;
+  is_active: boolean;
+};
+
+const ORDER: Punch[] = ["check_in", "break_out", "break_in", "check_out"];
+const LABELS: Record<Punch, string> = {
+  check_in: "Check In",
+  break_out: "Break Out",
+  break_in: "Break In",
+  check_out: "Check Out",
+};
+
+const ATTENDANCE_CONFLICT_MESSAGE =
+  "This attendance view is out of date. Another tab or an administrator changed today's record. Reload records before trying again. No changes were made.";
+
+class AttendanceConflictError extends Error {
+  constructor() {
+    super(ATTENDANCE_CONFLICT_MESSAGE);
+    this.name = "AttendanceConflictError";
+  }
+}
+
+function isAttendanceConflict(error: unknown): boolean {
+  if (!error || typeof error !== "object") return false;
+  const candidate = error as { code?: unknown; message?: unknown };
+  const code = typeof candidate.code === "string" ? candidate.code : "";
+  const message = typeof candidate.message === "string" ? candidate.message : "";
+  return (
+    code === "PGRST116" ||
+    code === "23505" ||
+    code === "40001" ||
+    /no rows|0 rows|multiple \(or no\) rows|duplicate key/i.test(message)
+  );
+}
+
+/**
+ * Return a warning only when a persisted row is inconsistent or out of order.
+ * A valid prefix such as check-in -> break-out with a pending break-in or
+ * check-out is a normal workday in progress and intentionally returns null.
+ */
+function attendanceWarning(row: DtrRow): string | null {
+  if (!row.id) return null;
+
+  const filled = ORDER.map((field) => Boolean(row[field]));
+  const firstMissing = filled.indexOf(false);
+  // The shared calculator accepts a complete day without a break pair.
+  // Still validate its timestamps below; this is not a change to punch order.
+  const completeWithoutBreak = row.check_in && row.check_out && !row.break_out && !row.break_in;
+  if (!completeWithoutBreak && firstMissing >= 0 && filled.slice(firstMissing + 1).some(Boolean)) {
+    return "This DTR has punches out of order. Refresh your records before making another change.";
+  }
+
+  const parsed = (value: string | null) => (value ? Date.parse(value) : null);
+  const checkIn = parsed(row.check_in);
+  const breakOut = parsed(row.break_out);
+  const breakIn = parsed(row.break_in);
+  const checkOut = parsed(row.check_out);
+  if (row.check_in && !Number.isFinite(checkIn))
+    return "This DTR contains an invalid check-in time.";
+  if (row.break_out && !Number.isFinite(breakOut))
+    return "This DTR contains an invalid break-out time.";
+  if (row.break_in && !Number.isFinite(breakIn))
+    return "This DTR contains an invalid break-in time.";
+  if (row.check_out && !Number.isFinite(checkOut))
+    return "This DTR contains an invalid check-out time.";
+  if (checkIn !== null && breakOut !== null && breakOut < checkIn) {
+    return "This DTR has inconsistent punch times. Refresh your records before making another change.";
+  }
+  if (breakOut !== null && breakIn !== null && breakIn <= breakOut) {
+    return "This DTR has inconsistent break times. Refresh your records before making another change.";
+  }
+  if (checkIn !== null && checkOut !== null && checkOut <= checkIn) {
+    return "This DTR has inconsistent punch times. Refresh your records before making another change.";
+  }
+  if (breakIn !== null && checkOut !== null && checkOut < breakIn) {
+    return "This DTR has inconsistent punch times. Refresh your records before making another change.";
+  }
+  return null;
+}
+
+const MONTHS = [
+  "January",
+  "February",
+  "March",
+  "April",
+  "May",
+  "June",
+  "July",
+  "August",
+  "September",
+  "October",
+  "November",
+  "December",
+];
+
+function todayKey() {
+  return attendanceDate();
+}
+
+function fmtTime(iso?: string | null) {
+  if (!iso) return "—";
+  return new Date(iso).toLocaleTimeString([], {
+    timeZone: ATTENDANCE_TIME_ZONE,
+    hour: "2-digit",
+    minute: "2-digit",
+  });
+}
+
+function fmtDate(key: string) {
+  const [y, m, d] = key.split("-").map(Number);
+  return new Date(Date.UTC(y, m - 1, d)).toLocaleDateString(undefined, {
+    timeZone: "UTC",
+    weekday: "short",
+    month: "short",
+    day: "numeric",
+  });
+}
+
+function escapeHtml(value: string) {
+  return value.replace(/[&<>"']/g, (character) => {
+    const entities: Record<string, string> = {
+      "&": "&amp;",
+      "<": "&lt;",
+      ">": "&gt;",
+      '"': "&quot;",
+      "'": "&#39;",
+    };
+    return entities[character];
+  });
+}
+
+function hhmm(iso: string | null): string {
+  if (!iso) return "";
+  return new Date(iso).toLocaleTimeString([], {
+    timeZone: ATTENDANCE_TIME_ZONE,
+    hour: "2-digit",
+    minute: "2-digit",
+    hour12: true,
+  });
+}
+
+// Filter a set of DTR rows down to only the ones that fall within the given
+// month/year. Used to keep the on-screen table in sync with whatever
+// month/year is selected in the dropdowns (instead of always showing every
+// row ever logged).
+function filterRowsByMonth<T extends DtrRow>(
+  rows: T[],
+  targetMonth: number,
+  targetYear: number,
+): T[] {
+  return rows.filter((r) => {
+    return (
+      Number(r.entry_date.slice(5, 7)) - 1 === targetMonth &&
+      Number(r.entry_date.slice(0, 4)) === targetYear
+    );
+  });
+}
+
+const EMPTY_PROFILE: Profile = {
+  account_type: "ojt",
+  required_workdays: null,
+  updated_at: "",
+  full_name: "",
+  student_id: "",
+  company: "",
+  ojt_title: "",
+  required_ojt_hours: null,
+  is_active: true,
+  is_admin: false,
+};
+
+function missingProfileFields(profile: Profile): string[] {
+  const missing: string[] = [];
+  if (!profile.full_name?.trim()) missing.push("Full Name");
+  if (!profile.student_id?.trim()) missing.push("Student ID");
+  if (!profile.company?.trim()) missing.push("Host Company");
+  if (!profile.ojt_title?.trim()) missing.push("OJT Title");
+  return missing;
+}
+
+// ── Shared DTR document builder ─────────────────────────────────────────────
+// Pulled out as standalone functions (not tied to component state) so both
+// the trainee's own dashboard AND the admin's per-trainee view can generate
+// the same printable/downloadable DTR document.
+function buildDtrHtmlFor(
+  profile: DtrReportProfile,
+  rows: DtrRow[],
+  targetMonth: number,
+  targetYear: number,
+) {
+  const fullName = profile.fullName;
+  const ojtTitle = profile.ojtTitle?.trim() || "Not provided";
+  const visibleRows = filterRowsByMonth(rows, targetMonth, targetYear);
+  const reportSummary = escapeHtml(
+    roleReportText(
+      {
+        account_type: profile.accountType,
+        required_ojt_hours: profile.requiredOjtHours,
+        required_workdays: profile.requiredWorkdays,
+        processing_contracts: profile.processingContracts,
+      },
+      visibleRows,
+      `${targetYear}-${String(targetMonth + 1).padStart(2, "0")}-01`,
+      `${targetYear}-${String(targetMonth + 1).padStart(2, "0")}-${new Date(targetYear, targetMonth + 1, 0).getDate()}`,
+    ),
+  );
+  const byDay: Record<number, DtrRow> = {};
+  for (const r of visibleRows) {
+    const day = Number(r.entry_date.slice(-2));
+    if (Number.isInteger(day)) byDay[day] = r;
+  }
+  const totalHours = visibleRows.reduce((sum, row) => sum + computeHours(row), 0);
+
+  const daysInMonth = new Date(Date.UTC(targetYear, targetMonth + 1, 0)).getUTCDate();
+  const isWeekend = (day: number) => {
+    const dow = new Date(Date.UTC(targetYear, targetMonth, day)).getUTCDay();
+    return dow === 0 || dow === 6;
+  };
+
+  const rows31: string[] = [];
+  for (let day = 1; day <= 31; day++) {
+    const row = day <= daysInMonth ? byDay[day] : null;
+    const weekend = day <= daysInMonth && isWeekend(day);
+    const color = weekend ? "#cc0000" : "#000000";
+    const amIn = row ? hhmm(row.check_in) : "";
+    const amOut = row ? hhmm(row.break_out) : "";
+    const pmIn = row ? hhmm(row.break_in) : "";
+    const pmOut = row ? hhmm(row.check_out) : "";
+    rows31.push(`
+      <tr>
+        <td style="color:${color};text-align:center;font-size:8.5px;padding:0 2px;">${day <= daysInMonth ? day : ""}</td>
+        <td style="font-size:7.5px;text-align:center;padding:0 1px;">${amIn}</td>
+        <td style="font-size:7.5px;text-align:center;padding:0 1px;">${amOut}</td>
+        <td style="font-size:7.5px;text-align:center;padding:0 1px;">${pmIn}</td>
+        <td style="font-size:7.5px;text-align:center;padding:0 1px;">${pmOut}</td><td style="font-size:7.5px;text-align:center;">${row?.travel_hours != null && ["job_order", "regular_employee"].includes(profile.accountType) ? "Travel" : ""}</td>
+      </tr>
+    `);
+  }
+
+  const monthLabel = `${MONTHS[targetMonth]} ${targetYear}`;
+
+  const copy = `
+    <div class="copy">
+      <div class="agency">NATIONAL COMMISSION OF SENIOR CITIZENS</div>
+      <div class="title-wrap"><h1>DAILY TIME RECORD</h1></div>
+      <div class="name-block">
+        <div class="name-value">${escapeHtml(fullName)}</div>
+      </div>
+      <div class="profile-line">${profile.accountType === "ojt" ? "OJT Title" : "Position"}: <strong>${escapeHtml(ojtTitle)}</strong></div>
+      <div class="month-line">For the month of: &nbsp;<strong>${monthLabel}</strong></div>
+      <table>
+        <thead>
+          <tr>
+            <th rowspan="2" style="width:20px;">Day</th>
+            <th colspan="2">AM</th>
+            <th colspan="2">PM</th>
+            <th rowspan="2" style="width:19%;">Remarks</th>
+          </tr>
+          <tr>
+            <th>Time In</th><th>Time Out</th>
+            <th>Time In</th><th>Time Out</th>
+          </tr>
+        </thead>
+        <tbody>${rows31.join("")}</tbody>
+      </table>
+      <div class="total-line">Monthly total: <strong>${totalHours.toFixed(2)} hrs</strong>${reportSummary ? `<br/>${reportSummary}` : ""}</div>
+      <div class="cert">
+        I CERTIFY on my honor that above is a true and correct<br/>
+        report of the hours of work performed, record of which was made<br/>
+        daily at the time of arrival at and departure from office.
+      </div>
+      <div class="trainee-sig">
+        <div class="sig-line"></div>
+        <div class="sig-name">${escapeHtml(fullName)}</div>
+      </div>
+      <div class="verified">Verified as to the prescribed office hours.</div>
+      <div class="supervisor-sig">
+        <div class="sig-name">Replace with supervisor name</div>
+        <div class="sig-line"></div>
+        <div class="sig-title">CHIEF ADMINISTRATIVE OFFICER</div>
+      </div>
+    </div>
+  `;
+
+  const styles = `
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    @page { size: A4 portrait; margin: 10mm 8mm; }
+    html, body { height: 100%; }
+    body { font-family: Arial, sans-serif; font-size: 10px; color: #000; height: 100%; }
+    .page { display: flex; flex-direction: row; width: 100%; min-height: 257mm; }
+    .copy { width: 50%; padding: 4mm 12mm; border-right: 1px dashed #bbb; display: flex; flex-direction: column; }
+    .copy:last-child { border-right: none; }
+    .agency { text-align: center; font-size: 7px; font-weight: bold; letter-spacing: 0.5px; margin-bottom: 5px; color: #172554; }
+    .title-wrap { border-top: 2.5px double #000; border-bottom: 2.5px double #000; padding: 3px 0; margin-bottom: 6px; }
+    h1 { font-size: 15px; font-weight: 900; text-align: center; letter-spacing: 1.5px; }
+    .name-block { text-align: center; margin-bottom: 1px; }
+    .name-value { font-size: 12px; font-weight: bold; border-bottom: 1px solid #000; display: inline-block; min-width: 160px; padding: 0 8px; text-align: center; }
+    .name-label { font-size: 8px; text-align: center; color: #c00; margin-bottom: 5px; }
+    .profile-line { font-size: 8px; text-align: center; margin-bottom: 3px; }
+    .month-line { font-size: 9px; margin-bottom: 5px; }
+    .month-line strong { font-weight: bold; }
+    table { width: 100%; border-collapse: collapse; }
+    thead { display: table-header-group; }
+    tr, .trainee-sig, .supervisor-sig { break-inside: avoid; page-break-inside: avoid; }
+    td, .total-line { font-variant-numeric: tabular-nums; }
+    table, th, td { border: 1px solid #000; }
+    th { font-size: 8px; text-align: center; padding: 2px 0; font-weight: bold; }
+    td { height: 13px; }
+    .total-line { font-size: 8px; text-align: right; margin-top: 4px; }
+    .cert { font-size: 8px; margin-top: 10px; line-height: 1.6; text-align: center; }
+    .trainee-sig { margin-top: 10px; text-align: center; }
+    .trainee-sig .sig-line { border-top: 1px solid #000; width: 80%; margin: 0 auto 2px; }
+    .trainee-sig .sig-name { font-size: 10px; font-weight: bold; }
+    .verified { font-size: 7.5px; margin-top: 6px; margin-bottom: 8px; }
+    .supervisor-sig { text-align: center; }
+    .supervisor-sig .sig-name { font-size: 10px; font-weight: bold; margin-bottom: 1px; }
+    .supervisor-sig .sig-line { border-top: 2.5px solid #000; width: 80%; margin: 0 auto 2px; }
+    .supervisor-sig .sig-title { font-size: 9px; font-weight: bold; }
+    @media print { body { -webkit-print-color-adjust: exact; print-color-adjust: exact; } }
+  `;
+
+  const html = `<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8"/>
+<title>DTR – ${monthLabel}</title>
+<style>${styles}</style>
+</head>
+<body>
+<div class="page">${copy}${copy}</div>
+</body>
+</html>`;
+
+  return { html, monthLabel };
+}
+
+function printDtrFor(
+  profile: DtrReportProfile,
+  rows: DtrRow[],
+  targetMonth: number,
+  targetYear: number,
+) {
+  const { html } = buildDtrHtmlFor(profile, rows, targetMonth, targetYear);
+  const iframe = document.createElement("iframe");
+  // Allow printing and parent access, but never scripts in the generated document.
+  iframe.setAttribute("sandbox", "allow-same-origin allow-modals");
+  iframe.style.cssText = "width:0;height:0;border:none;position:absolute;left:-9999px;top:-9999px;";
+  document.body.appendChild(iframe);
+  iframe.srcdoc = html;
+  iframe.onload = () => {
+    iframe.contentWindow?.print();
+    setTimeout(() => document.body.removeChild(iframe), 2000);
+  };
+}
+
+function downloadWordDtrFor(
+  profile: DtrReportProfile,
+  rows: DtrRow[],
+  targetMonth: number,
+  targetYear: number,
+) {
+  const fullName = profile.fullName;
+  const ojtTitle = profile.ojtTitle?.trim() || "Not provided";
+  const visibleRows = filterRowsByMonth(rows, targetMonth, targetYear);
+  const reportSummary = escapeHtml(
+    roleReportText(
+      {
+        account_type: profile.accountType,
+        required_ojt_hours: profile.requiredOjtHours,
+        required_workdays: profile.requiredWorkdays,
+        processing_contracts: profile.processingContracts,
+      },
+      visibleRows,
+      `${targetYear}-${String(targetMonth + 1).padStart(2, "0")}-01`,
+      `${targetYear}-${String(targetMonth + 1).padStart(2, "0")}-${new Date(targetYear, targetMonth + 1, 0).getDate()}`,
+    ),
+  );
+  const monthLabel = `${MONTHS[targetMonth]} ${targetYear}`;
+
+  const byDay: Record<number, DtrRow> = {};
+  for (const r of visibleRows) {
+    const day = Number(r.entry_date.slice(-2));
+    if (Number.isInteger(day)) byDay[day] = r;
+  }
+  const totalHours = visibleRows.reduce((sum, row) => sum + computeHours(row), 0);
+
+  const daysInMonth = new Date(Date.UTC(targetYear, targetMonth + 1, 0)).getUTCDate();
+  const isWeekend = (day: number) => {
+    const dow = new Date(Date.UTC(targetYear, targetMonth, day)).getUTCDay();
+    return dow === 0 || dow === 6;
+  };
+
+  const cell = (txt: string, extra = "") =>
+    `<td style="border:1px solid #000;font-size:7.5pt;text-align:center;vertical-align:middle;padding:1px 2px;height:14px;${extra}">${txt}</td>`;
+
+  const hdrCell = (txt: string, extra = "") =>
+    `<td style="border:1px solid #000;font-size:7.5pt;font-weight:bold;text-align:center;vertical-align:middle;padding:2px;${extra}">${txt}</td>`;
+
+  let rows31 = "";
+  for (let day = 1; day <= 31; day++) {
+    const row = day <= daysInMonth ? byDay[day] : null;
+    const weekend = day <= daysInMonth && isWeekend(day);
+    const col = weekend ? "color:#cc0000;" : "";
+    const dl = day <= daysInMonth ? String(day) : "";
+    const a1 = row ? hhmm(row.check_in) : "";
+    const a2 = row ? hhmm(row.break_out) : "";
+    const p1 = row ? hhmm(row.break_in) : "";
+    const p2 = row ? hhmm(row.check_out) : "";
+    rows31 += `<tr>
+      ${cell(dl, col)}
+      ${cell(a1)}
+      ${cell(a2)}
+      ${cell(p1)}
+      ${cell(p2)}
+      ${cell(row?.travel_hours != null && ["job_order", "regular_employee"].includes(profile.accountType) ? "Travel" : "")}
+    </tr>`;
+  }
+
+  const makeCopy = () => `
+<table style="width:100%;border-collapse:collapse;table-layout:fixed;font-family:Arial,sans-serif;">
+<colgroup>
+  <col style="width:13%;"/>
+  <col style="width:17%;"/>
+  <col style="width:17%;"/>
+  <col style="width:17%;"/>
+  <col style="width:17%;"/>
+<col style="width:19%;"/>
+</colgroup>
+<tr><td colspan="6" style="text-align:center;font-size:6pt;font-weight:bold;letter-spacing:0.4pt;color:#172554;padding-bottom:4px;">NATIONAL COMMISSION OF SENIOR CITIZENS</td></tr>
+<tr>
+  <td colspan="6" style="
+    border-top:2.5pt double #000;
+    border-bottom:2.5pt double #000;
+    border-left:none;border-right:none;
+    text-align:center;
+    font-size:13pt;
+    font-weight:bold;
+    letter-spacing:1.5pt;
+    padding:4px 0;
+    font-family:Arial,sans-serif;
+  ">DAILY TIME RECORD</td>
+</tr>
+<tr>
+  <td colspan="6" style="
+    text-align:center;
+    font-size:10pt;
+    font-weight:bold;
+    border-bottom:1px solid #000;
+    border-top:none;border-left:none;border-right:none;
+    padding:3px 0 1px;
+    font-family:Arial,sans-serif;
+  ">${escapeHtml(fullName)}</td>
+</tr>
+<tr>
+  <td colspan="6" style="
+    text-align:center;
+    font-size:8pt;
+    border:none;
+    padding:2px 0 1px;
+    font-family:Arial,sans-serif;
+  ">${profile.accountType === "ojt" ? "OJT Title" : "Position"}: <strong>${escapeHtml(ojtTitle)}</strong></td>
+</tr>
+<tr>
+  <td colspan="6" style="
+    font-size:8pt;
+    border:none;
+    padding:3px 0 4px;
+    font-family:Arial,sans-serif;
+  ">For the month of: &nbsp;<strong>${monthLabel}</strong></td>
+</tr>
+<tr>
+  <td rowspan="2" style="
+    border:1px solid #000;
+    font-size:7.5pt;
+    font-weight:bold;
+    text-align:center;
+    vertical-align:middle;
+    padding:2px;
+  ">Day</td>
+  <td colspan="2" style="
+    border:1px solid #000;
+    font-size:7.5pt;
+    font-weight:bold;
+    text-align:center;
+    vertical-align:middle;
+    padding:2px;
+  ">AM</td>
+  <td colspan="2" style="
+    border:1px solid #000;
+    font-size:7.5pt;
+    font-weight:bold;
+    text-align:center;
+    vertical-align:middle;
+    padding:2px;
+  ">PM</td>
+  <td rowspan="2" style="border:1px solid #000;font-size:7pt;text-align:center;font-weight:bold;">Remarks</td>
+</tr>
+<tr>
+  ${hdrCell("Time In")}
+  ${hdrCell("Time Out")}
+  ${hdrCell("Time In")}
+  ${hdrCell("Time Out")}
+</tr>
+${rows31}
+<tr>
+  <td colspan="6" style="
+    font-size:7.5pt;
+    text-align:right;
+    border:none;
+    padding:4px 0 0;
+    font-family:Arial,sans-serif;
+  ">Monthly total: <strong>${totalHours.toFixed(2)} hrs</strong>${reportSummary ? `<br/>${reportSummary}` : ""}</td>
+</tr>
+<tr>
+  <td colspan="6" style="
+    font-size:6.5pt;
+    text-align:center;
+    vertical-align:middle;
+    border:none;
+    padding:10px 4px 4px;
+    line-height:1.8;
+    font-family:Arial,sans-serif;
+  ">
+    I CERTIFY on my honor that above is a true and correct<br/>
+    report of the hours of work performed, record of which was made<br/>
+    daily at the time of arrival at and departure from office.
+  </td>
+</tr>
+<tr>
+  <td colspan="6" style="border:none;padding:20px 0 0;text-align:center;">
+    <table style="width:80%;margin:0 auto;border-collapse:collapse;">
+      <tr>
+        <td style="border-top:1px solid #000;text-align:center;font-size:9.5pt;font-weight:bold;padding:4px 0 2px;font-family:Arial,sans-serif;">
+          ${escapeHtml(fullName)}
+        </td>
+      </tr>
+    </table>
+  </td>
+</tr>
+<tr>
+  <td colspan="6" style="
+    border:none;
+    font-size:7.5pt;
+    padding:6px 0 16px;
+    text-align:center;
+    font-family:Arial,sans-serif;
+  ">Verified as to the prescribed office hours.</td>
+</tr>
+<tr>
+  <td colspan="6" style="
+    border:none;
+    text-align:center;
+    font-size:9.5pt;
+    font-weight:bold;
+    padding:2px 0 0;
+    font-family:Arial,sans-serif;
+  ">Replace with supervisor name</td>
+</tr>
+<tr>
+  <td colspan="6" style="border:none;padding:0;text-align:center;">
+    <table style="width:80%;margin:0 auto;border-collapse:collapse;">
+      <tr>
+        <td style="border-top:2pt solid #000;text-align:center;font-size:8.5pt;font-weight:bold;padding:4px 0 2px;font-family:Arial,sans-serif;">
+          CHIEF ADMINISTRATIVE OFFICER
+        </td>
+      </tr>
+    </table>
+  </td>
+</tr>
+</table>`;
+
+  const wordHtml = `
+<html xmlns:o="urn:schemas-microsoft-com:office:office"
+    xmlns:w="urn:schemas-microsoft-com:office:word"
+    xmlns="http://www.w3.org/TR/REC-html40">
+<head>
+<meta charset="utf-8"/>
+<title>DTR – ${monthLabel}</title>
+<!--[if gte mso 9]><xml>
+  <w:WordDocument>
+    <w:View>Print</w:View>
+    <w:Zoom>100</w:Zoom>
+    <w:DoNotOptimizeForBrowser/>
+  </w:WordDocument>
+</xml><![endif]-->
+<style>
+  @page {
+    size: 21cm 29.7cm;
+    margin: 10mm 8mm;
+  }
+  body {
+    font-family: Arial, sans-serif;
+    font-size: 9pt;
+    color: #000;
+    margin: 0;
+    padding: 0;
+  }
+  table { border-collapse: collapse; }
+  tr { page-break-inside: avoid; }
+  td { font-variant-numeric: tabular-nums; }
+</style>
+</head>
+<body>
+<table style="width:100%;border-collapse:collapse;table-layout:fixed;">
+  <colgroup>
+    <col style="width:44%;"/>
+    <col style="width:12%;"/>
+    <col style="width:44%;"/>
+  </colgroup>
+  <tr>
+    <td style="vertical-align:top;padding:0 8px 0 0;">${makeCopy()}</td>
+    <td style="border-left:1px dashed #bbb;padding:0;"></td>
+    <td style="vertical-align:top;padding:0 0 0 8px;">${makeCopy()}</td>
+  </tr>
+</table>
+</body>
+</html>`;
+
+  const blob = new Blob(["\ufeff", wordHtml], { type: "application/msword" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = `DTR-${MONTHS[targetMonth]}-${targetYear}-${fullName.replace(/\s+/g, "_") || "account"}.doc`;
+  a.click();
+  URL.revokeObjectURL(url);
+}
+
+function csvCell(value: string): string {
+  return `"${value.replaceAll('"', '""')}"`;
+}
+
+function buildDtrCsv(rows: DtrRow[], targetMonth: number, targetYear: number): string {
+  const visibleRows = filterRowsByMonth(rows, targetMonth, targetYear);
+  const csvRows = [
+    ["Date", "Check In", "Break Out", "Break In", "Check Out", "Hours"],
+    ...visibleRows.map((r) => [
+      r.entry_date,
+      fmtTime(r.check_in),
+      fmtTime(r.break_out),
+      fmtTime(r.break_in),
+      fmtTime(r.check_out),
+      computeHours(r).toFixed(2),
+    ]),
+  ];
+  return csvRows.map((row) => row.map(csvCell).join(",")).join("\n");
+}
+
+// ── Main Dashboard ─────────────────────────────────────────────────────────────
+function DashboardPage() {
+  const { user } = Route.useRouteContext();
+  return user.app_metadata?.dtr_access_role === "security_monitor" ? (
+    <SecurityMonitor />
+  ) : (
+    <EmployeeDashboard />
+  );
+}
+
+function EmployeeDashboard() {
+  const navigate = useNavigate();
+  const [userId, setUserId] = useState<string | null>(null);
+  const [email, setEmail] = useState<string>("");
+  const [rows, setRows] = useState<DtrRow[]>([]);
+  const [profile, setProfile] = useState<Profile>(EMPTY_PROFILE);
+  const [profileDirty, setProfileDirty] = useState(false);
+  const [savingProfile, setSavingProfile] = useState(false);
+  const [targetInput, setTargetInput] = useState("");
+  const [savingTarget, setSavingTarget] = useState(false);
+  const [targetError, setTargetError] = useState("");
+  const [now, setNow] = useState(new Date());
+  const [loading, setLoading] = useState(true);
+  const [loadError, setLoadError] = useState("");
+  const [actionError, setActionError] = useState("");
+  const [attendanceConflict, setAttendanceConflict] = useState(false);
+  const [accountInactive, setAccountInactive] = useState(false);
+  const [savingAttendance, setSavingAttendance] = useState(false);
+  const [checkoutMessage, setCheckoutMessage] = useState("");
+  const [checkoutCelebration, setCheckoutCelebration] = useState<"saved" | "goal" | null>(null);
+  const attendanceLock = useRef(false);
+  const profileLock = useRef(false);
+  const inactiveSessionLock = useRef(false);
+
+  // Month/year the user wants to view/download the DTR for. This now also
+  // drives which rows are shown in the table below (see visibleRows).
+  const [downloadMonth, setDownloadMonth] = useState<number>(attendanceMonth);
+  const [downloadYear, setDownloadYear] = useState<number>(attendanceYear);
+
+  useEffect(() => {
+    const t = setInterval(() => setNow(new Date()), 1000);
+    return () => clearInterval(t);
+  }, []);
+
+  const endInactiveSession = async () => {
+    if (inactiveSessionLock.current) return false;
+    inactiveSessionLock.current = true;
+    setAccountInactive(true);
+    setRows([]);
+    await supabase.auth.signOut();
+    navigate({ to: "/auth" });
+    return false;
+  };
+
+  const ensureActiveSession = async () => {
+    if (!userId || accountInactive) return false;
+    const { data, error } = await supabase
+      .from("profiles")
+      .select("is_active")
+      .eq("id", userId)
+      .maybeSingle();
+    if (error) {
+      setActionError(`Your account status could not be checked. ${error.message}`);
+      return false;
+    }
+    if (!data?.is_active) return endInactiveSession();
+    return true;
+  };
+
+  useEffect(() => {
+    (async () => {
+      try {
+        const { data: u } = await supabase.auth.getUser();
+        if (!u.user) {
+          navigate({ to: "/auth" });
+          return;
+        }
+        setUserId(u.user.id);
+        setEmail(u.user.email ?? "");
+
+        const [profileResult, entriesResult] = await Promise.all([
+          supabase
+            .from("profiles")
+            .select("*, processing_contracts(*)")
+            .eq("id", u.user.id)
+            .maybeSingle(),
+          loadDtrRows(u.user.id),
+        ]);
+
+        if (profileResult.error) throw profileResult.error;
+        if (profileResult.data) {
+          const loadedProfile = { ...EMPTY_PROFILE, ...profileResult.data };
+          if (!loadedProfile.is_active) {
+            setAccountInactive(true);
+            setRows([]);
+            await supabase.auth.signOut();
+            navigate({ to: "/auth" });
+            return;
+          }
+          setProfile(loadedProfile);
+          setTargetInput(
+            loadedProfile.required_ojt_hours == null
+              ? ""
+              : String(loadedProfile.required_ojt_hours),
+          );
+        }
+        setRows(entriesResult);
+      } catch (error) {
+        setLoadError(
+          error instanceof Error ? error.message : "Unable to load your records. Please try again.",
+        );
+      } finally {
+        setLoading(false);
+      }
+    })();
+  }, [navigate]);
+
+  const key = todayKey();
+  const today: DtrRow = useMemo(
+    () =>
+      rows.find((r) => r.entry_date === key) ?? {
+        entry_date: key,
+        check_in: null,
+        break_out: null,
+        break_in: null,
+        check_out: null,
+      },
+    [rows, key],
+  );
+
+  // Strict, manual order — no auto "skip ahead" logic. Whatever hasn't been
+  // punched yet, in order, is next.
+  const nextPunch: Punch | null = useMemo(() => {
+    if (today.travel_hours != null) return null;
+    for (const p of ORDER) {
+      if (!today[p]) return p;
+    }
+    return null;
+  }, [today]);
+
+  const todayWarning = useMemo(() => attendanceWarning(today), [today]);
+
+  const punch = async (p: Punch) => {
+    if (!userId || attendanceLock.current || p !== nextPunch) return;
+    attendanceLock.current = true;
+    setSavingAttendance(true);
+    setCheckoutMessage("");
+    setCheckoutCelebration(null);
+    setActionError("");
+    setAttendanceConflict(false);
+    try {
+      if (!(await ensureActiveSession())) return;
+      const { data, error } = await supabase.rpc("dtr_punch", {
+        action: p,
+        expected_date: key,
+        expected_id: today.id ?? null,
+        expected_check_in: today.check_in,
+        expected_break_out: today.break_out,
+        expected_break_in: today.break_in,
+        expected_check_out: today.check_out,
+        undo: false,
+      });
+      if (error) {
+        if (isAttendanceConflict(error)) throw new AttendanceConflictError();
+        throw new Error(`Attendance was not saved. ${error.message}`);
+      }
+      if (!data) throw new AttendanceConflictError();
+      if (p === "check_out") {
+        const before = accountProgress(profile, rows);
+        const after = accountProgress(profile, [
+          data as DtrRow,
+          ...rows.filter((r) => r.entry_date !== key),
+        ]);
+        const gained = (after.credited ?? 0) - (before.credited ?? 0);
+        if (computeHours(data as DtrRow) > 0) {
+          setCheckoutCelebration(
+            before.percentage !== null &&
+              before.percentage < 100 &&
+              after.percentage !== null &&
+              after.percentage >= 100
+              ? "goal"
+              : "saved",
+          );
+        }
+        if (after.unit && gained > 0) {
+          const reward =
+            after.unit === "hours"
+              ? `${gained.toFixed(2)} credited hours`
+              : `${gained} completed workday${gained === 1 ? "" : "s"}`;
+          setCheckoutMessage(
+            `Checkout saved. +${reward}! ${after.percentage !== null && after.percentage >= 100 ? "Goal reached. Well done!" : "That's another step forward. Well done today!"}`,
+          );
+        }
+      }
+      if (data) {
+        setRows((prev) => {
+          const other = prev.filter((r) => r.entry_date !== key);
+          return [data as DtrRow, ...other];
+        });
+      }
+    } catch (error) {
+      const conflict = error instanceof AttendanceConflictError || isAttendanceConflict(error);
+      setAttendanceConflict(conflict);
+      setActionError(
+        conflict
+          ? ATTENDANCE_CONFLICT_MESSAGE
+          : error instanceof Error
+            ? error.message
+            : "Attendance was not saved. Check your connection and try again.",
+      );
+    } finally {
+      attendanceLock.current = false;
+      setSavingAttendance(false);
+    }
+  };
+
+  const saveProfile = async () => {
+    if (!userId || profileLock.current) return;
+    const missing = missingProfileFields(profile);
+    if (missing.length > 0) {
+      setActionError(`Please complete the required trainee details: ${missing.join(", ")}.`);
+      return;
+    }
+    profileLock.current = true;
+    setSavingProfile(true);
+    setActionError("");
+    setAttendanceConflict(false);
+    try {
+      if (!(await ensureActiveSession())) return;
+      const { data, error } = await supabase
+        .from("profiles")
+        .update({
+          full_name: profile.full_name,
+          student_id: profile.student_id,
+          company: profile.company,
+          ojt_title: profile.ojt_title,
+        })
+        .eq("id", userId)
+        .eq("updated_at", profile.updated_at)
+        .select()
+        .single();
+      if (error?.code === "PGRST116")
+        throw new Error(
+          "Your profile changed in another session. Reload the page before saving again.",
+        );
+      if (error) throw new Error(error.message);
+      setProfile((current) => ({ ...current, updated_at: data.updated_at }));
+      setProfileDirty(false);
+    } catch (error) {
+      setActionError(
+        error instanceof Error ? error.message : "Profile was not saved. Please try again.",
+      );
+    } finally {
+      profileLock.current = false;
+      setSavingProfile(false);
+    }
+  };
+
+  const saveTarget = async () => {
+    if (!userId || profileLock.current) return;
+    const value = targetInput.trim();
+    const target = value === "" ? null : Number(value);
+    if (target !== null && (!Number.isFinite(target) || target <= 0 || target > 10000)) {
+      setTargetError("Enter a required OJT target between 0 and 10,000 hours.");
+      return;
+    }
+
+    profileLock.current = true;
+    setSavingTarget(true);
+    setTargetError("");
+    try {
+      if (!(await ensureActiveSession())) return;
+      const { data, error } = await supabase
+        .from("profiles")
+        .update({ required_ojt_hours: target })
+        .eq("id", userId)
+        .eq("updated_at", profile.updated_at)
+        .select("required_ojt_hours, updated_at")
+        .single();
+      if (error) {
+        setTargetError(
+          error.code === "PGRST116"
+            ? "Your profile changed in another session. Reload the page before saving again."
+            : `Target was not saved. ${error.message}`,
+        );
+      } else {
+        const savedTarget = data.required_ojt_hours;
+        setProfile((current) => ({
+          ...current,
+          required_ojt_hours: savedTarget,
+          updated_at: data.updated_at,
+        }));
+        setTargetInput(savedTarget == null ? "" : String(savedTarget));
+      }
+    } catch {
+      setTargetError("Target was not saved. Check your connection and try again.");
+    } finally {
+      profileLock.current = false;
+      setSavingTarget(false);
+    }
+  };
+
+  const signOut = async () => {
+    setAttendanceConflict(false);
+    const { error } = await supabase.auth.signOut();
+    if (error) {
+      setActionError(error.message);
+      return;
+    }
+    navigate({ to: "/auth" });
+  };
+
+  // Only the rows for the currently selected month/year — this is what the
+  // Daily Time Record table on screen renders, so the table always matches
+  // whatever month is picked in the dropdown above it.
+  const visibleRows = useMemo(
+    () => filterRowsByMonth(rows, downloadMonth, downloadYear),
+    [rows, downloadMonth, downloadYear],
+  );
+
+  const exportCsv = async () => {
+    if (!(await ensureActiveSession())) return;
+    const csv = buildDtrCsv(rows, downloadMonth, downloadYear);
+    const blob = new Blob([csv], { type: "text/csv" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `dtr-${MONTHS[downloadMonth]}-${downloadYear}.csv`;
+    a.click();
+    URL.revokeObjectURL(url);
+  };
+
+  // Trainee's print/download now just delegate to the shared standalone
+  // functions defined above the component, passing this trainee's own data.
+  // These still receive the FULL `rows` (not visibleRows) since the document
+  // builder itself does its own month/year filtering internally.
+  const printDtr = async () => {
+    if (!(await ensureActiveSession())) return;
+    printDtrFor(
+      {
+        fullName: profile.full_name || "",
+        ojtTitle: profile.ojt_title,
+        accountType: profile.account_type,
+        requiredOjtHours: profile.required_ojt_hours,
+        requiredWorkdays: profile.required_workdays,
+        processingContracts: profile.processing_contracts,
+      },
+      rows,
+      downloadMonth,
+      downloadYear,
+    );
+  };
+
+  const downloadWordDtr = async () => {
+    if (!(await ensureActiveSession())) return;
+    downloadWordDtrFor(
+      {
+        fullName: profile.full_name || "",
+        ojtTitle: profile.ojt_title,
+        accountType: profile.account_type,
+        requiredOjtHours: profile.required_ojt_hours,
+        requiredWorkdays: profile.required_workdays,
+        processingContracts: profile.processing_contracts,
+      },
+      rows,
+      downloadMonth,
+      downloadYear,
+    );
+  };
+
+  const totalHours = useMemo(
+    () => visibleRows.reduce((s, r) => s + computeHours(r), 0),
+    [visibleRows],
+  );
+
+  const targetDirty =
+    targetInput !== (profile.required_ojt_hours == null ? "" : String(profile.required_ojt_hours));
+
+  // Build a list of years available for selection, based on existing rows
+  // (plus the current year), so the dropdown always has something sensible.
+  const availableYears = useMemo(() => {
+    const years = new Set<number>();
+    years.add(attendanceYear());
+    for (const r of rows) {
+      const y = Number(r.entry_date.slice(0, 4));
+      years.add(y);
+    }
+    return Array.from(years).sort((a, b) => b - a);
+  }, [rows]);
+
+  return (
+    <div className="min-h-screen bg-slate-50">
+      <header className="border-b border-slate-200 bg-white">
+        <div className="mx-auto flex max-w-5xl flex-col gap-3 px-4 py-4 sm:flex-row sm:items-center sm:justify-between sm:px-6 sm:py-5">
+          <div className="flex items-center gap-3">
+            <img
+              src={ncscLogo}
+              alt="National Commission of Senior Citizens"
+              className="h-10 w-10 shrink-0 rounded-full object-contain sm:h-12 sm:w-12"
+            />
+            <div className="min-w-0">
+              <h1 className="text-lg font-semibold tracking-tight text-slate-900 sm:text-xl">
+                NCSC Attendance · {profile.is_admin ? "Admin" : "DTR"}
+              </h1>
+              <p className="text-xs text-slate-500">
+                Signed in as {profile.full_name || email}
+                {profile.is_admin && (
+                  <span className="ml-2 rounded-full bg-slate-900 px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-white">
+                    Admin
+                  </span>
+                )}
+              </p>
+            </div>
+          </div>
+          <div className="flex flex-wrap items-center justify-between gap-3 sm:justify-end">
+            <div className="text-left sm:text-right">
+              <div className="font-mono text-xl font-semibold text-slate-900 sm:text-2xl">
+                {now.toLocaleTimeString([], {
+                  timeZone: ATTENDANCE_TIME_ZONE,
+                  hour: "2-digit",
+                  minute: "2-digit",
+                  second: "2-digit",
+                })}
+              </div>
+              <div className="text-xs text-slate-500">
+                {now.toLocaleDateString(undefined, {
+                  timeZone: ATTENDANCE_TIME_ZONE,
+                  weekday: "long",
+                  year: "numeric",
+                  month: "long",
+                  day: "numeric",
+                })}
+              </div>
+            </div>
+            <Link
+              to="/reset-password"
+              className="inline-flex min-h-11 items-center rounded-lg px-3 text-xs font-semibold text-blue-900 hover:bg-blue-50"
+            >
+              Change password
+            </Link>
+            <button
+              onClick={signOut}
+              className="min-h-11 shrink-0 rounded-lg border border-slate-300 bg-white px-4 py-2 text-xs font-semibold text-slate-700 shadow-sm hover:bg-slate-50"
+            >
+              Sign out
+            </button>
+          </div>
+        </div>
+      </header>
+
+      <main className="mx-auto max-w-6xl space-y-4 px-3 py-5 sm:space-y-6 sm:px-6 sm:py-8">
+        {!loading && !loadError && (
+          <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+            <div>
+              <p className="text-xs font-semibold uppercase tracking-widest text-blue-800">
+                {profile.is_admin ? "Administration" : "Your attendance"}
+              </p>
+              <h2 className="mt-1 text-xl font-semibold tracking-tight text-slate-900">
+                Welcome back
+                {profile.full_name?.trim() ? `, ${profile.full_name.trim().split(/\s+/)[0]}` : ""}.
+              </h2>
+              <p className="mt-1 text-sm text-slate-500">
+                {profile.is_admin
+                  ? "A clear view of your team, attendance, and records."
+                  : "One place to record your day and review your attendance."}
+              </p>
+            </div>
+            {!profile.is_admin && (
+              <span className="inline-flex w-fit items-center gap-2 rounded-full border border-slate-200 bg-white px-3 py-2 text-xs font-medium text-slate-700">
+                <Clock3 aria-hidden="true" className="h-4 w-4 text-blue-700" />
+                {todayWarning
+                  ? "Attendance needs attention"
+                  : !nextPunch
+                    ? "Today's attendance complete"
+                    : today.check_in
+                      ? `Up next: ${LABELS[nextPunch]}`
+                      : "Ready to start your day"}
+              </span>
+            )}
+          </div>
+        )}
+        {actionError && (
+          <div
+            role="alert"
+            aria-live="assertive"
+            className="rounded border border-red-200 bg-red-50 p-3 text-sm text-red-700"
+          >
+            <p>{actionError}</p>
+            {attendanceConflict && (
+              <button
+                type="button"
+                onClick={() => window.location.reload()}
+                className="mt-2 rounded-md border border-red-300 bg-white px-3 py-1.5 text-xs font-semibold text-red-700 underline-offset-2 hover:bg-red-100 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-red-700"
+              >
+                Reload records
+              </button>
+            )}
+          </div>
+        )}
+        {loading ? (
+          <AttendanceLoading label="Loading your dashboard…" />
+        ) : loadError ? (
+          <div role="alert" className="rounded border border-red-200 bg-white p-5 text-red-700">
+            <p>{loadError}</p>
+            <button
+              className="mt-2 rounded px-1 underline focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-slate-900"
+              onClick={() => window.location.reload()}
+            >
+              Reload records
+            </button>
+          </div>
+        ) : profile.is_admin ? (
+          <AdminDashboard />
+        ) : (
+          <>
+            {profile.account_type !== "ojt" ? (
+              <AccountProfileSummary profile={profile} />
+            ) : (
+              <>
+                <p className="text-sm">Account type: {accountLabels.ojt}</p>
+                {/* Profile */}
+                <section className="rounded-2xl border border-slate-200 bg-white shadow-sm p-4 sm:p-5">
+                  <div className="mb-3 flex items-center justify-between">
+                    <h2 className="text-sm font-semibold text-slate-900">Trainee details</h2>
+                    {profileDirty && (
+                      <button
+                        onClick={saveProfile}
+                        disabled={savingProfile || savingTarget}
+                        className="rounded-md bg-slate-900 px-3 py-1.5 text-xs font-semibold text-white hover:bg-slate-800 disabled:opacity-60"
+                      >
+                        {savingProfile ? "Saving…" : "Save"}
+                      </button>
+                    )}
+                  </div>
+                  {missingProfileFields(profile).length > 0 && (
+                    <p
+                      role="status"
+                      className="mb-3 rounded border border-amber-200 bg-amber-50 p-3 text-xs text-amber-800"
+                    >
+                      Complete your required trainee details (
+                      {missingProfileFields(profile).join(", ")}) to keep your profile information
+                      up to date. Your existing attendance records remain available.
+                    </p>
+                  )}
+                  <fieldset
+                    disabled={savingProfile || savingTarget}
+                    className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4"
+                  >
+                    <ProfileField
+                      label="Full Name"
+                      required
+                      value={profile.full_name ?? ""}
+                      onChange={(v) => {
+                        setProfile({ ...profile, full_name: v });
+                        setProfileDirty(true);
+                      }}
+                      placeholder="Juan Dela Cruz"
+                    />
+                    <ProfileField
+                      label="Student ID"
+                      required
+                      value={profile.student_id ?? ""}
+                      onChange={(v) => {
+                        setProfile({ ...profile, student_id: v });
+                        setProfileDirty(true);
+                      }}
+                      placeholder="2024-00001"
+                    />
+                    <ProfileField
+                      label="Host Company"
+                      required
+                      value={profile.company ?? ""}
+                      onChange={(v) => {
+                        setProfile({ ...profile, company: v });
+                        setProfileDirty(true);
+                      }}
+                      placeholder="Acme Corp."
+                    />
+                    <ProfileField
+                      label="OJT Title"
+                      required
+                      value={profile.ojt_title ?? ""}
+                      onChange={(v) => {
+                        setProfile({ ...profile, ojt_title: v });
+                        setProfileDirty(true);
+                      }}
+                      placeholder="Data Analyst Intern"
+                    />
+                  </fieldset>
+                </section>
+
+                {/* OJT progress */}
+                <section
+                  aria-labelledby="ojt-progress-heading"
+                  className="rounded-2xl border border-slate-200 bg-white shadow-sm p-4 sm:p-5"
+                >
+                  <div className="flex flex-col gap-4 sm:flex-row sm:items-start sm:justify-between">
+                    <div>
+                      <h2
+                        id="ojt-progress-heading"
+                        className="text-sm font-semibold text-slate-900"
+                      >
+                        OJT hour target
+                      </h2>
+                      <p className="mt-1 text-xs text-slate-500">
+                        Completed hours use every complete DTR day in your account.
+                      </p>
+                    </div>
+                    <div className="flex items-end gap-2">
+                      <label className="block">
+                        <span className="text-xs font-medium uppercase tracking-wide text-slate-500">
+                          Required hours
+                        </span>
+                        <input
+                          type="number"
+                          min="0.01"
+                          max="10000"
+                          step="0.01"
+                          aria-label="Required OJT hours"
+                          disabled={savingProfile || savingTarget}
+                          value={targetInput}
+                          onChange={(e) => {
+                            setTargetInput(e.target.value);
+                            setTargetError("");
+                          }}
+                          placeholder="486"
+                          className="mt-1 w-28 rounded-md border border-slate-200 bg-white px-3 py-2 text-sm text-slate-900 outline-none focus:border-slate-400"
+                        />
+                      </label>
+                      {targetDirty && (
+                        <button
+                          onClick={saveTarget}
+                          disabled={savingProfile || savingTarget}
+                          className="rounded-md bg-slate-900 px-3 py-2 text-xs font-semibold text-white hover:bg-slate-800 disabled:opacity-60"
+                        >
+                          {savingTarget ? "Saving…" : "Save target"}
+                        </button>
+                      )}
+                    </div>
+                  </div>
+
+                  {targetError && (
+                    <p
+                      role="alert"
+                      className="mt-3 rounded border border-red-200 bg-red-50 p-3 text-xs text-red-700"
+                    >
+                      {targetError}
+                    </p>
+                  )}
+                </section>
+              </>
+            )}
+            <AccountProgressSummary
+              profile={profile}
+              records={rows}
+              checkoutMessage={checkoutMessage}
+            />
+
+            {profile.account_type === "processing" && (
+              <ProcessingContracts contracts={profile.processing_contracts ?? []} records={rows} />
+            )}
+
+            {/* Punch card */}
+            <section
+              aria-label="Today's attendance"
+              aria-busy={savingAttendance}
+              className="rounded-2xl border border-slate-200 bg-white p-4 shadow-sm sm:p-6"
+            >
+              <div className="mb-5 flex items-center justify-between gap-2">
+                <h2 className="text-sm font-semibold uppercase tracking-wide text-slate-500">
+                  Today · {fmtDate(key)}
+                </h2>
+              </div>
+
+              <TravelDetails row={today} />
+              {today.travel_hours == null && (
+                <ol aria-label="Attendance steps" className="grid grid-cols-2 gap-3 sm:grid-cols-4">
+                  {ORDER.map((p, index) => {
+                    const done = Boolean(today[p]);
+                    const isNext = nextPunch === p;
+                    return (
+                      <li
+                        key={p}
+                        aria-current={isNext ? "step" : undefined}
+                        className={`relative rounded-xl border p-3 sm:p-4 ${
+                          done
+                            ? "border-emerald-200 bg-emerald-50"
+                            : isNext
+                              ? "border-blue-300 bg-blue-50 ring-1 ring-blue-200"
+                              : "border-slate-200 bg-slate-50"
+                        }`}
+                      >
+                        {index < 3 && (
+                          <span
+                            aria-hidden="true"
+                            className={`absolute -right-3 top-7 z-10 hidden h-0.5 w-3 sm:block ${done ? "bg-emerald-300" : "bg-slate-200"}`}
+                          />
+                        )}
+                        <div className="mb-3 flex items-center justify-between gap-1">
+                          <span
+                            className={`flex h-7 w-7 items-center justify-center rounded-full text-xs font-semibold ${done ? "bg-emerald-700 text-white" : isNext ? "bg-blue-900 text-white" : "bg-slate-200 text-slate-600"}`}
+                            aria-hidden="true"
+                          >
+                            {done ? (
+                              <Check
+                                className={
+                                  p === "check_out" && checkoutCelebration
+                                    ? "checkout-tick h-4 w-4"
+                                    : "h-4 w-4"
+                                }
+                              />
+                            ) : (
+                              index + 1
+                            )}
+                          </span>
+                          <span
+                            className={`text-[10px] font-semibold ${done ? "text-emerald-800" : isNext ? "text-blue-900" : "text-slate-500"}`}
+                          >
+                            {done ? "Recorded" : isNext ? "Up next" : "Pending"}
+                          </span>
+                        </div>
+                        <div className="text-[11px] font-medium uppercase tracking-wide text-slate-500 sm:text-xs">
+                          {LABELS[p]}
+                        </div>
+                        <div className="mt-1 font-mono text-base font-semibold text-slate-900 sm:text-lg">
+                          {fmtTime(today[p])}
+                        </div>
+                      </li>
+                    );
+                  })}
+                </ol>
+              )}
+
+              {todayWarning ? (
+                <p
+                  role="alert"
+                  aria-live="assertive"
+                  className="mt-4 rounded-md border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-800"
+                >
+                  {todayWarning}
+                </p>
+              ) : today.id && nextPunch ? (
+                <p
+                  role="status"
+                  aria-live="polite"
+                  className="mt-4 rounded-md border border-slate-100 bg-slate-50 px-3 py-2 text-xs text-slate-600"
+                >
+                  Day in progress · next step: {LABELS[nextPunch]}.
+                </p>
+              ) : null}
+
+              <div className="mt-6 flex flex-col gap-3 sm:flex-row sm:flex-wrap sm:items-center">
+                {nextPunch ? (
+                  <button
+                    onClick={() => punch(nextPunch)}
+                    disabled={savingAttendance}
+                    aria-busy={savingAttendance}
+                    className="min-h-11 w-full rounded-lg bg-blue-950 px-5 py-3 text-sm font-semibold text-white shadow-sm hover:bg-blue-900 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-blue-900 disabled:cursor-not-allowed disabled:opacity-40 sm:w-auto"
+                  >
+                    {savingAttendance ? "Saving…" : `${LABELS[nextPunch]} now`}
+                  </button>
+                ) : (
+                  <div className="relative overflow-hidden rounded-xl bg-emerald-100 py-4 pl-4 pr-10 text-sm font-medium text-emerald-800">
+                    {checkoutCelebration && (
+                      <CheckoutCelebration goalReached={checkoutCelebration === "goal"} />
+                    )}
+                    Day complete · {checkoutMessage || `${computeHours(today).toFixed(2)} hrs`}
+                  </div>
+                )}
+                {today.travel_hours == null && (
+                  <span className="text-xs text-slate-500" aria-live="polite">
+                    Tap each button yourself — Break Out, Break In, and Check Out are no longer
+                    logged automatically.
+                  </span>
+                )}
+                {savingAttendance && (
+                  <span role="status" aria-live="polite" className="text-xs text-slate-500">
+                    Saving attendance…
+                  </span>
+                )}
+              </div>
+              {(profile.account_type === "job_order" ||
+                profile.account_type === "regular_employee") && (
+                <TravelOut
+                  date={key}
+                  disabled={savingAttendance || Boolean(today.id)}
+                  onBusy={setSavingAttendance}
+                  onSaved={async () => {
+                    if (userId) setRows(await loadDtrRows(userId));
+                  }}
+                />
+              )}
+            </section>
+
+            {/* DTR table */}
+            <section className="rounded-2xl border border-slate-200 bg-white shadow-sm">
+              <div className="flex flex-col gap-3 border-b border-slate-200 px-4 py-4 sm:px-5">
+                <div>
+                  <h2 className="text-sm font-semibold text-slate-900">Daily Time Record</h2>
+                  <p className="text-xs text-slate-500">
+                    {MONTHS[downloadMonth]} {downloadYear} · Total logged: {totalHours.toFixed(2)}{" "}
+                    hrs across {visibleRows.length} day{visibleRows.length === 1 ? "" : "s"}
+                  </p>
+                </div>
+                <div className="grid grid-cols-2 gap-2 sm:flex sm:flex-wrap sm:items-center">
+                  {/* Month/year picker — now filters the table too, not just downloads */}
+                  <select
+                    value={downloadMonth}
+                    onChange={(e) => setDownloadMonth(Number(e.target.value))}
+                    className="col-span-1 rounded-md border border-slate-200 bg-white px-2 py-1.5 text-xs font-medium text-slate-700 outline-none focus:border-slate-400"
+                    aria-label="Select month to view/download"
+                  >
+                    {MONTHS.map((m, i) => (
+                      <option key={m} value={i}>
+                        {m}
+                      </option>
+                    ))}
+                  </select>
+                  <select
+                    value={downloadYear}
+                    onChange={(e) => setDownloadYear(Number(e.target.value))}
+                    className="col-span-1 rounded-md border border-slate-200 bg-white px-2 py-1.5 text-xs font-medium text-slate-700 outline-none focus:border-slate-400"
+                    aria-label="Select year to view/download"
+                  >
+                    {availableYears.map((y) => (
+                      <option key={y} value={y}>
+                        {y}
+                      </option>
+                    ))}
+                  </select>
+                  <button
+                    onClick={exportCsv}
+                    className="rounded-md border border-slate-200 px-3 py-1.5 text-xs font-medium text-slate-700 hover:bg-slate-50"
+                  >
+                    Export CSV
+                  </button>
+                  <button
+                    onClick={printDtr}
+                    className="rounded-md border border-slate-200 px-3 py-1.5 text-xs font-medium text-slate-700 hover:bg-slate-50"
+                  >
+                    Print DTR
+                  </button>
+                  <button
+                    onClick={downloadWordDtr}
+                    className="col-span-2 rounded-md border border-slate-200 px-3 py-1.5 text-xs font-medium text-slate-700 hover:bg-slate-50 sm:col-span-1"
+                  >
+                    Download Word
+                  </button>
+                </div>
+              </div>
+
+              {/* Mobile: card list */}
+              <AttendanceCalendar
+                key={`${downloadYear}-${downloadMonth}`}
+                records={visibleRows}
+                month={downloadMonth}
+                year={downloadYear}
+                today={key}
+                warning={attendanceWarning}
+              />
+              <div className="divide-y divide-slate-100 sm:hidden">
+                {visibleRows.length === 0 && (
+                  <AttendanceEmpty
+                    title={`No records for ${MONTHS[downloadMonth]} ${downloadYear}.`}
+                    description="Your attendance history starts with your first check-in. Choose another month to review earlier records."
+                  />
+                )}
+                {visibleRows.map((r) => {
+                  const h = computeHours(r);
+                  return (
+                    <div key={r.entry_date} className="px-4 py-3">
+                      <div className="mb-2 flex items-center justify-between">
+                        <span className="text-sm font-medium text-slate-900">
+                          {fmtDate(r.entry_date)}
+                          <TravelDetails row={r} />
+                        </span>
+                        <span className="font-mono text-xs text-slate-500">
+                          {h ? `${h.toFixed(2)} hrs` : "—"}
+                        </span>
+                      </div>
+                      <div className="grid grid-cols-2 gap-x-3 gap-y-1 text-xs text-slate-600">
+                        <div>
+                          <span className="text-slate-400">Check In: </span>
+                          <span className="font-mono">{fmtTime(r.check_in)}</span>
+                        </div>
+                        <div>
+                          <span className="text-slate-400">Break Out: </span>
+                          <span className="font-mono">{fmtTime(r.break_out)}</span>
+                        </div>
+                        <div>
+                          <span className="text-slate-400">Break In: </span>
+                          <span className="font-mono">{fmtTime(r.break_in)}</span>
+                        </div>
+                        <div>
+                          <span className="text-slate-400">Check Out: </span>
+                          <span className="font-mono">{fmtTime(r.check_out)}</span>
+                        </div>
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+
+              {/* Desktop/tablet: table */}
+              <div className="hidden overflow-x-auto sm:block">
+                <table className="w-full text-sm">
+                  <thead className="bg-slate-50 text-left text-xs uppercase tracking-wide text-slate-500">
+                    <tr>
+                      <th className="px-5 py-3 font-medium">Date</th>
+                      <th className="px-5 py-3 font-medium">Check In</th>
+                      <th className="px-5 py-3 font-medium">Break Out</th>
+                      <th className="px-5 py-3 font-medium">Break In</th>
+                      <th className="px-5 py-3 font-medium">Check Out</th>
+                      <th className="px-5 py-3 text-right font-medium">Hours</th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-slate-100">
+                    {visibleRows.length === 0 && (
+                      <tr>
+                        <td colSpan={6}>
+                          <AttendanceEmpty
+                            title={`No records for ${MONTHS[downloadMonth]} ${downloadYear}.`}
+                            description="Your attendance history starts with your first check-in. Choose another month to review earlier records."
+                          />
+                        </td>
+                      </tr>
+                    )}
+                    {visibleRows.map((r) => {
+                      const h = computeHours(r);
+                      return (
+                        <tr key={r.entry_date} className="text-slate-700">
+                          <td className="px-5 py-3 font-medium text-slate-900">
+                            {fmtDate(r.entry_date)}
+                            <TravelDetails row={r} />
+                          </td>
+                          <td className="px-5 py-3 font-mono">{fmtTime(r.check_in)}</td>
+                          <td className="px-5 py-3 font-mono">{fmtTime(r.break_out)}</td>
+                          <td className="px-5 py-3 font-mono">{fmtTime(r.break_in)}</td>
+                          <td className="px-5 py-3 font-mono">{fmtTime(r.check_out)}</td>
+                          <td className="px-5 py-3 text-right font-mono">
+                            {h ? h.toFixed(2) : "—"}
+                          </td>
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                </table>
+              </div>
+            </section>
+          </>
+        )}
+      </main>
+    </div>
+  );
+}
+
+function ProfileField({
+  label,
+  required = false,
+  value,
+  onChange,
+  placeholder,
+}: {
+  label: string;
+  required?: boolean;
+  value: string;
+  onChange: (v: string) => void;
+  placeholder?: string;
+}) {
+  return (
+    <label className="block">
+      <span className="text-xs font-medium uppercase tracking-wide text-slate-500">
+        {label}
+        {required && (
+          <span className="ml-1 text-red-500" aria-hidden="true">
+            *
+          </span>
+        )}
+      </span>
+      <input
+        required={required}
+        aria-label={label}
+        value={value}
+        onChange={(e) => onChange(e.target.value)}
+        placeholder={placeholder}
+        className="mt-1 w-full rounded-md border border-slate-200 bg-white px-3 py-2 text-sm text-slate-900 outline-none focus:border-slate-400"
+      />
+    </label>
+  );
+}
+
+// ── Admin Dashboard ──────────────────────────────────────────────────────────
+// Shown instead of the trainee punch-in UI when profile.is_admin is true.
+// Lets an admin browse every trainee and view/manage their DTR entries.
+// Requires RLS SELECT (and optionally UPDATE/DELETE) policies on `profiles`
+// and `dtr_entries` that allow rows where the caller's own profile has
+// is_admin = true. See setup notes below the component.
+
+type TraineeDtr = DtrRow & { user_id: string };
+
+function AdminDashboard() {
+  const [chiefRequest, setChiefRequest] = useState<ChiefRequest | null>(null);
+  const [editor, setEditor] = useState<{ userId: string; initial?: EditableDtr } | null>(null);
+  const [deletionTarget, setDeletionTarget] = useState<TraineeRow | null>(null);
+  const [deletionConfirmation, setDeletionConfirmation] = useState("");
+  const deletingAccount = chiefRequest?.operation === "delete_account";
+  const [deletionError, setDeletionError] = useState("");
+  const [deletionSuccess, setDeletionSuccess] = useState("");
+  const requestVersion = useRef(0);
+  const mutating = Boolean(chiefRequest || editor);
+  const [trainees, setTrainees] = useState<TraineeRow[]>([]);
+  const [loadingTrainees, setLoadingTrainees] = useState(true);
+  const [traineeError, setTraineeError] = useState<string | null>(null);
+
+  const [selectedId, setSelectedId] = useState<string | null>(null);
+  const [entries, setEntries] = useState<TraineeDtr[]>([]);
+  const [loadingEntries, setLoadingEntries] = useState(false);
+  const [entriesError, setEntriesError] = useState<string | null>(null);
+  const [mutationError, setMutationError] = useState("");
+  const [mutationConflict, setMutationConflict] = useState(false);
+
+  const [search, setSearch] = useState("");
+  const [accountTypeFilter, setAccountTypeFilter] = useState<Enums<"account_type"> | "all">("all");
+
+  // Month/year the admin wants to view/print/download for the selected
+  // trainee. This now also drives which rows are shown in the table below.
+  const [docMonth, setDocMonth] = useState<number>(attendanceMonth);
+  const [docYear, setDocYear] = useState<number>(attendanceYear);
+  const [editFullName, setEditFullName] = useState("");
+  const [editStudentId, setEditStudentId] = useState("");
+  const [editCompany, setEditCompany] = useState("");
+  const [editOjtTitle, setEditOjtTitle] = useState("");
+  const [requiredHoursInput, setRequiredHoursInput] = useState("");
+  const [savingProfile, setSavingProfile] = useState(false);
+  const [profileEditError, setProfileEditError] = useState("");
+  const [profileEditSuccess, setProfileEditSuccess] = useState("");
+  const [savingStatus, setSavingStatus] = useState(false);
+  const [statusError, setStatusError] = useState("");
+  const [statusSuccess, setStatusSuccess] = useState("");
+  const [creatingAccount, setCreatingAccount] = useState(false);
+
+  useEffect(() => {
+    (async () => {
+      try {
+        setTrainees(await loadProfiles());
+      } catch {
+        setTraineeError("Unable to load accounts. Reload the page to try again.");
+      } finally {
+        setLoadingTrainees(false);
+      }
+    })();
+  }, []);
+
+  const accountCreated = (profile: CreatedTraineeProfile) => {
+    setTrainees((current) =>
+      [...current, profile as TraineeRow].sort((a, b) =>
+        (a.full_name ?? "").localeCompare(b.full_name ?? ""),
+      ),
+    );
+    ++requestVersion.current;
+    setSelectedId(profile.id);
+    setEntries([]);
+    setLoadingEntries(false);
+    setEntriesError(null);
+    setEditFullName(profile.full_name ?? "");
+    setEditStudentId(profile.student_id ?? "");
+    setEditCompany(profile.company ?? "");
+    setEditOjtTitle(profile.ojt_title ?? "");
+    setRequiredHoursInput(
+      profile.required_ojt_hours == null ? "" : String(profile.required_ojt_hours),
+    );
+  };
+
+  const loadEntries = async (userId: string) => {
+    const version = ++requestVersion.current;
+    const trainee = trainees.find((row) => row.id === userId);
+    setSelectedId(userId);
+    setEditFullName(trainee?.full_name ?? "");
+    setEditStudentId(trainee?.student_id ?? "");
+    setEditCompany(trainee?.company ?? "");
+    setEditOjtTitle(trainee?.ojt_title ?? "");
+    setRequiredHoursInput(
+      trainee?.required_ojt_hours == null ? "" : String(trainee.required_ojt_hours),
+    );
+    setProfileEditError("");
+    setProfileEditSuccess("");
+    setStatusError("");
+    setStatusSuccess("");
+    setMutationError("");
+    setMutationConflict(false);
+    setEntries([]);
+    setLoadingEntries(true);
+    setEntriesError(null);
+    try {
+      const data = await loadDtrRows(userId);
+      if (version !== requestVersion.current) return;
+      setEntries(data);
+    } catch {
+      if (version !== requestVersion.current) return;
+      setEntriesError("Unable to load attendance. Select the account again to retry.");
+    } finally {
+      if (version === requestVersion.current) setLoadingEntries(false);
+    }
+  };
+
+  const deleteEntry = (entryId: string) => {
+    const entry = entries.find((row) => row.id === entryId);
+    if (entry) setEditor({ userId: entry.user_id, initial: entry });
+  };
+  const clearPunch = (entryId: string, field: Punch) => {
+    const entry = entries.find((row) => row.id === entryId);
+    if (entry) setEditor({ userId: entry.user_id, initial: { ...entry, [field]: null } });
+  };
+
+  const saveTraineeProfile = async () => {
+    if (!selectedTrainee || savingProfile) return;
+    const version = requestVersion.current;
+    const fullName = editFullName.trim();
+    const studentId = editStudentId.trim();
+    const company = editCompany.trim();
+    const ojtTitle = editOjtTitle.trim();
+    const value = requiredHoursInput.trim();
+    const target = value === "" ? null : Number(value);
+    const missing = [
+      !fullName && "Full Name",
+      !studentId && "Student ID",
+      !company && "Host Company",
+      !ojtTitle && "OJT Title",
+    ].filter(Boolean) as string[];
+    if (missing.length > 0) {
+      setProfileEditError(`Complete the required fields: ${missing.join(", ")}.`);
+      setProfileEditSuccess("");
+      return;
+    }
+    if (target !== null && (!Number.isFinite(target) || target <= 0 || target > 10000)) {
+      setProfileEditError("Enter a target between 0 and 10,000 hours, or leave it blank.");
+      setProfileEditSuccess("");
+      return;
+    }
+
+    setSavingProfile(true);
+    setProfileEditError("");
+    setProfileEditSuccess("");
+    const { data, error } = await supabase.rpc("dtr_admin_update_trainee_profile", {
+      expected_updated_at: selectedTrainee.updated_at,
+      target_user_id: selectedTrainee.id,
+      new_full_name: fullName,
+      new_student_id: studentId,
+      new_company: company,
+      new_ojt_title: ojtTitle,
+      new_required_ojt_hours: target,
+    });
+    if (error) {
+      if (version === requestVersion.current)
+        setProfileEditError(`Profile was not saved. ${error.message}`);
+    } else if (data) {
+      setTrainees((current) =>
+        current.map((trainee) =>
+          trainee.id === selectedTrainee.id
+            ? {
+                ...trainee,
+                full_name: data.full_name,
+                student_id: data.student_id,
+                company: data.company,
+                ojt_title: data.ojt_title,
+                required_ojt_hours: data.required_ojt_hours,
+                is_admin: data.is_admin,
+                updated_at: data.updated_at,
+              }
+            : trainee,
+        ),
+      );
+      if (version === requestVersion.current) {
+        setEditFullName(data.full_name ?? "");
+        setEditStudentId(data.student_id ?? "");
+        setEditCompany(data.company ?? "");
+        setEditOjtTitle(data.ojt_title ?? "");
+        setRequiredHoursInput(
+          data.required_ojt_hours == null ? "" : String(data.required_ojt_hours),
+        );
+        setProfileEditSuccess("Trainee profile saved.");
+      }
+    }
+    setSavingProfile(false);
+  };
+
+  const setAccountActive = async () => {
+    if (!selectedTrainee || savingStatus) return;
+    const version = requestVersion.current;
+    const nextActive = !selectedTrainee.is_active;
+    if (
+      !nextActive &&
+      !window.confirm(
+        "Deactivate this account? Their profile and attendance history will be preserved, but they will be signed out and blocked from DTR operations.",
+      )
+    )
+      return;
+
+    setSavingStatus(true);
+    setStatusError("");
+    setStatusSuccess("");
+    setProfileEditSuccess("");
+    const { data, error } = await supabase.rpc("dtr_admin_set_account_active", {
+      target_user_id: selectedTrainee.id,
+      target_active: nextActive,
+    });
+    if (error) {
+      if (version === requestVersion.current)
+        setStatusError(`Account status was not changed. ${error.message}`);
+    } else if (data) {
+      setTrainees((current) =>
+        current.map((trainee) =>
+          trainee.id === selectedTrainee.id
+            ? { ...trainee, is_active: data.is_active, updated_at: data.updated_at }
+            : trainee,
+        ),
+      );
+      if (version === requestVersion.current)
+        setStatusSuccess(data.is_active ? "Account reactivated." : "Account deactivated.");
+    }
+    setSavingStatus(false);
+  };
+
+  const selectedTrainee = trainees.find((t) => t.id === selectedId);
+
+  const confirmAccountDeletion = () => {
+    if (!deletionTarget || deletionConfirmation !== deletionTarget.id) return;
+    setChiefRequest({
+      requestId: crypto.randomUUID(),
+      operation: "delete_account",
+      payload: { targetUserId: deletionTarget.id, confirmation: deletionConfirmation },
+    });
+  };
+
+  const filteredTrainees = useMemo(() => {
+    const q = search.trim().toLowerCase();
+    return trainees.filter(
+      (t) =>
+        (accountTypeFilter === "all" || t.account_type === accountTypeFilter) &&
+        (!q ||
+          [t.full_name, t.student_id, t.company, t.ojt_title]
+            .filter(Boolean)
+            .some((v) => (v as string).toLowerCase().includes(q))),
+    );
+  }, [trainees, search, accountTypeFilter]);
+
+  // Only the selected trainee's rows for the currently selected month/year —
+  // this is what the table below renders, kept in sync with the dropdowns.
+  const visibleEntries = useMemo(
+    () => filterRowsByMonth(entries, docMonth, docYear),
+    [entries, docMonth, docYear],
+  );
+
+  const selectedTotalHours = useMemo(
+    () => visibleEntries.reduce((s, r) => s + computeHours(r), 0),
+    [visibleEntries],
+  );
+
+  const exportSelectedCsv = () => {
+    if (!selectedTrainee) return;
+    const csv = buildDtrCsv(entries, docMonth, docYear);
+    const blob = new Blob([csv], { type: "text/csv" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `dtr-${(selectedTrainee.full_name || selectedTrainee.id).replace(/\s+/g, "_")}-${MONTHS[docMonth]}-${docYear}.csv`;
+    a.click();
+    URL.revokeObjectURL(url);
+  };
+
+  // Years available in the picker, based on the selected trainee's own
+  // entries (plus the current year), same approach as the trainee dashboard.
+  const availableYears = useMemo(() => {
+    const years = new Set<number>();
+    years.add(attendanceYear());
+    for (const r of entries) {
+      const y = Number(r.entry_date.slice(0, 4));
+      years.add(y);
+    }
+    return Array.from(years).sort((a, b) => b - a);
+  }, [entries]);
+
+  const printSelectedDtr = () => {
+    if (!selectedTrainee) return;
+    printDtrFor(
+      {
+        fullName: selectedTrainee.full_name || "",
+        ojtTitle: selectedTrainee.ojt_title,
+        accountType: selectedTrainee.account_type,
+        requiredOjtHours: selectedTrainee.required_ojt_hours,
+        requiredWorkdays: selectedTrainee.required_workdays,
+        processingContracts: selectedTrainee.processing_contracts,
+      },
+      entries,
+      docMonth,
+      docYear,
+    );
+  };
+
+  const downloadSelectedWordDtr = () => {
+    if (!selectedTrainee) return;
+    downloadWordDtrFor(
+      {
+        fullName: selectedTrainee.full_name || "",
+        ojtTitle: selectedTrainee.ojt_title,
+        accountType: selectedTrainee.account_type,
+        requiredOjtHours: selectedTrainee.required_ojt_hours,
+        requiredWorkdays: selectedTrainee.required_workdays,
+        processingContracts: selectedTrainee.processing_contracts,
+      },
+      entries,
+      docMonth,
+      docYear,
+    );
+  };
+
+  return (
+    <AdminWorkspace
+      reports={
+        <AdminReports
+          profiles={trainees}
+          profilesLoading={loadingTrainees}
+          profilesError={traineeError}
+        />
+      }
+      settings={<ChiefSettings />}
+    >
+      <div>
+        <h2 id="manage-accounts-heading" className="text-base font-semibold text-slate-900">
+          Manage Accounts
+        </h2>
+        <p className="text-xs text-slate-500">
+          Use deactivation for routine removal; it preserves the account's profile and DTR history.
+          Permanent deletion is only available for accounts with no DTR records.
+        </p>
+      </div>
+      {deletionSuccess && (
+        <p role="status" className="text-sm text-emerald-700">
+          {deletionSuccess}
+        </p>
+      )}
+      {deletionError && !deletionTarget && (
+        <p role="alert" className="text-sm text-red-700">
+          {deletionError}
+        </p>
+      )}
+      <AlertDialog
+        open={Boolean(deletionTarget) && !chiefRequest}
+        onOpenChange={(open) => {
+          if (!open && !deletingAccount) {
+            setDeletionTarget(null);
+            setDeletionConfirmation("");
+            setDeletionError("");
+          }
+        }}
+      >
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>Permanently delete account?</AlertDialogTitle>
+            <AlertDialogDescription>
+              This permanently removes {deletionTarget?.full_name || "this account"}'s sign-in
+              account, profile, and authentication sessions. It cannot be undone. Accounts with any
+              DTR records are protected. Choose deactivation to retain the account instead.
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <p className="break-all text-sm">
+            Account ID: <strong>{deletionTarget?.id}</strong>
+          </p>
+          <label className="block text-sm">
+            Type the account ID to confirm
+            <input
+              value={deletionConfirmation}
+              onChange={(event) => setDeletionConfirmation(event.target.value)}
+              autoComplete="off"
+              disabled={deletingAccount}
+              className="mt-1 w-full rounded border p-2"
+            />
+          </label>
+          {deletionError && (
+            <p role="alert" className="text-sm text-red-700">
+              {deletionError}
+            </p>
+          )}
+          <AlertDialogFooter>
+            <AlertDialogCancel disabled={deletingAccount}>Cancel</AlertDialogCancel>
+            <button
+              onClick={confirmAccountDeletion}
+              disabled={
+                deletingAccount || !deletionTarget || deletionConfirmation !== deletionTarget.id
+              }
+              className="rounded bg-red-700 px-4 py-2 text-sm text-white disabled:opacity-50"
+            >
+              {deletingAccount ? "Deleting..." : "Permanently delete account"}
+            </button>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
+      {editor && (
+        <DtrEditor
+          key={editor.userId}
+          userId={editor.userId}
+          allowTravel={
+            selectedTrainee?.account_type === "job_order" ||
+            selectedTrainee?.account_type === "regular_employee"
+          }
+          rows={entries}
+          initial={editor.initial}
+          onClose={() => setEditor(null)}
+          onSaved={() => {
+            setMutationError("");
+            setDeletionSuccess("DTR correction saved with Chief approval.");
+            void loadEntries(editor.userId);
+          }}
+        />
+      )}
+      {chiefRequest && (
+        <ChiefApproval
+          request={chiefRequest}
+          onClose={() => {
+            setChiefRequest(null);
+            setDeletionTarget(null);
+            setDeletionConfirmation("");
+          }}
+          onComplete={(result) => {
+            setChiefRequest(null);
+            setDeletionTarget(null);
+            setDeletionConfirmation("");
+            setDeletionSuccess("Account permanently deleted with Chief approval.");
+            if (result.deletedId) {
+              setTrainees((current) => current.filter((t) => t.id !== result.deletedId));
+              setSelectedId(null);
+              setEntries([]);
+            }
+          }}
+        />
+      )}
+      <CreateAccountForm
+        disabled={deletingAccount}
+        onCreated={accountCreated}
+        onBusyChange={setCreatingAccount}
+      />
+      <fieldset
+        disabled={mutating}
+        aria-busy={mutating}
+        className="grid min-w-0 gap-4 sm:gap-6 lg:grid-cols-[300px_1fr]"
+      >
+        {/* Account list */}
+        <section
+          aria-label="Account list"
+          className="rounded-2xl border border-slate-200 bg-white p-4 shadow-sm"
+        >
+          <div className="mb-3 flex items-center justify-between">
+            <h2 className="text-sm font-semibold text-slate-900">
+              Accounts {trainees.length > 0 && `(${trainees.length})`}
+            </h2>
+          </div>
+          <label className="mb-3 block">
+            <span className="mb-1 block text-xs font-semibold text-slate-600">Account type</span>
+            <select
+              aria-label="Filter accounts by type"
+              value={accountTypeFilter}
+              onChange={(e) =>
+                setAccountTypeFilter(e.target.value as Enums<"account_type"> | "all")
+              }
+              className="min-h-11 w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm text-slate-900"
+            >
+              <option value="all">All account types</option>
+              {Object.entries(supportedAccountLabels).map(([value, label]) => (
+                <option key={value} value={value}>
+                  {label}
+                </option>
+              ))}
+            </select>
+          </label>
+          <input
+            aria-label="Search accounts"
+            value={search}
+            onChange={(e) => setSearch(e.target.value)}
+            placeholder="Search name, ID, company…"
+            className="mb-3 w-full rounded-md border border-slate-200 bg-white px-3 py-2 text-xs text-slate-900 outline-none focus:border-slate-400"
+          />
+          {!loadingTrainees && !traineeError && (
+            <p aria-live="polite" aria-atomic="true" className="mb-3 text-xs text-slate-500">
+              Showing {filteredTrainees.length} of {trainees.length} accounts
+            </p>
+          )}
+          {traineeError && (
+            <p className="mb-2 text-xs text-red-600">
+              Couldn't load accounts. Reload the page to try again.
+            </p>
+          )}
+          {loadingTrainees ? (
+            <AttendanceLoading label="Loading accounts…" />
+          ) : filteredTrainees.length === 0 ? (
+            <AttendanceEmpty
+              title="No accounts found."
+              description="Try another account type or change your search."
+            />
+          ) : (
+            <ul className="max-h-[50vh] space-y-1 overflow-y-auto lg:max-h-[70vh]">
+              {filteredTrainees.map((t) => (
+                <li key={t.id}>
+                  <button
+                    aria-pressed={selectedId === t.id}
+                    onClick={() => loadEntries(t.id)}
+                    className={`w-full rounded-xl border px-3 py-3 text-left text-sm transition-colors ${
+                      selectedId === t.id
+                        ? "border-blue-900 bg-blue-950 text-white shadow-sm"
+                        : "border-transparent text-slate-700 hover:border-slate-200 hover:bg-slate-50"
+                    }`}
+                  >
+                    <div className="break-words font-semibold">{t.full_name || "Unnamed"}</div>
+                    <span
+                      className={`my-1 inline-flex rounded-md px-2 py-0.5 text-[10px] font-semibold ${selectedId === t.id ? "bg-white/15 text-blue-100" : "bg-blue-50 text-blue-900"}`}
+                    >
+                      {accountLabels[t.account_type]}
+                    </span>
+                    <div
+                      className={`text-xs ${
+                        selectedId === t.id ? "text-slate-300" : "text-slate-600"
+                      }`}
+                    >
+                      {t.account_type === "ojt"
+                        ? t.student_id || "No ID"
+                        : accountLabels[t.account_type]}{" "}
+                      · {t.company || "No company"}
+                    </div>
+                    <div
+                      className={`text-xs ${
+                        selectedId === t.id ? "text-slate-300" : "text-slate-600"
+                      }`}
+                    >
+                      {t.ojt_title || "Position not provided"}
+                    </div>
+                    <div
+                      className={`text-xs ${
+                        selectedId === t.id ? "text-slate-300" : "text-slate-600"
+                      }`}
+                    >
+                      {t.account_type === "ojt"
+                        ? t.required_ojt_hours == null
+                          ? "OJT target not set"
+                          : `Target: ${t.required_ojt_hours} hrs`
+                        : t.account_type === "processing"
+                          ? `Required workdays: ${currentProcessingContract(t.processing_contracts ?? [])?.required_workdays ?? "Not configured"}`
+                          : accountLabels[t.account_type]}
+                    </div>
+                    <div
+                      className={`mt-2 inline-flex items-center gap-1.5 rounded-full px-2 py-1 text-[10px] font-semibold ${
+                        selectedId === t.id
+                          ? t.is_active
+                            ? "bg-emerald-950 text-emerald-200"
+                            : "bg-amber-950 text-amber-200"
+                          : t.is_active
+                            ? "bg-emerald-50 text-emerald-800"
+                            : "bg-amber-50 text-amber-800"
+                      }`}
+                    >
+                      <span aria-hidden="true" className="h-1.5 w-1.5 rounded-full bg-current" />
+                      {t.is_active ? "Active account" : "Inactive account"}
+                    </div>
+                  </button>
+                </li>
+              ))}
+            </ul>
+          )}
+        </section>
+
+        {/* Selected trainee's DTR */}
+        <div className="rounded-2xl border border-slate-200 bg-white shadow-sm">
+          <div className="flex flex-col gap-3 border-b border-slate-200 px-4 py-4 sm:px-5">
+            <div>
+              <h2 className="text-sm font-semibold text-slate-900">
+                {selectedTrainee
+                  ? `${selectedTrainee.full_name || "Unnamed"}'s DTR`
+                  : "Select an account"}
+              </h2>
+              {selectedTrainee && (
+                <p className="text-xs text-slate-500">
+                  {selectedTrainee.account_type === "ojt"
+                    ? selectedTrainee.student_id || "No ID"
+                    : accountLabels[selectedTrainee.account_type]}
+                  {" \u00b7 "}
+                  {selectedTrainee.company || "No company"}
+                  {" \u00b7 "}
+                  {selectedTrainee.ojt_title || "Position not provided"}
+                  {" \u00b7 "}
+                  {MONTHS[docMonth]} {docYear}
+                  {" \u00b7 "}
+                  Total: {selectedTotalHours.toFixed(2)} hrs across {visibleEntries.length} day
+                  {visibleEntries.length === 1 ? "" : "s"}
+                </p>
+              )}
+              {selectedTrainee && (
+                <div className="mt-4 space-y-4 rounded-lg border border-slate-200 bg-slate-50 p-3 sm:p-4">
+                  <AccountProfileSummary profile={selectedTrainee} />
+                  {!loadingEntries && !entriesError && (
+                    <AccountProgressSummary profile={selectedTrainee} records={entries} />
+                  )}
+                  {selectedTrainee.account_type === "processing" &&
+                    !loadingEntries &&
+                    !entriesError && (
+                      <ProcessingContracts
+                        key={selectedTrainee.id}
+                        userId={selectedTrainee.id}
+                        contracts={selectedTrainee.processing_contracts ?? []}
+                        records={entries}
+                        onSaved={async () => setTrainees(await loadProfiles())}
+                      />
+                    )}
+                  {selectedTrainee.account_type === "ojt" && (
+                    <>
+                      <div className="border-t border-slate-200 pt-4">
+                        <h3 className="text-xs font-semibold uppercase tracking-wide text-slate-500">
+                          Trainee profile
+                        </h3>
+                        <p className="mt-1 text-xs text-slate-500">
+                          Update profile details and the school-specific OJT target.
+                        </p>
+                      </div>
+                      <div className="grid gap-3 sm:grid-cols-2">
+                        <label className="block">
+                          <span className="text-xs font-medium text-slate-600">Full Name</span>
+                          <input
+                            value={editFullName}
+                            onChange={(e) => {
+                              setEditFullName(e.target.value);
+                              setProfileEditError("");
+                              setProfileEditSuccess("");
+                            }}
+                            className="mt-1 w-full rounded-md border border-slate-200 bg-white px-3 py-2 text-sm text-slate-900 outline-none focus:border-slate-400"
+                          />
+                        </label>
+                        <label className="block">
+                          <span className="text-xs font-medium text-slate-600">Student ID</span>
+                          <input
+                            value={editStudentId}
+                            onChange={(e) => {
+                              setEditStudentId(e.target.value);
+                              setProfileEditError("");
+                              setProfileEditSuccess("");
+                            }}
+                            className="mt-1 w-full rounded-md border border-slate-200 bg-white px-3 py-2 text-sm text-slate-900 outline-none focus:border-slate-400"
+                          />
+                        </label>
+                        <label className="block">
+                          <span className="text-xs font-medium text-slate-600">Host Company</span>
+                          <input
+                            value={editCompany}
+                            onChange={(e) => {
+                              setEditCompany(e.target.value);
+                              setProfileEditError("");
+                              setProfileEditSuccess("");
+                            }}
+                            className="mt-1 w-full rounded-md border border-slate-200 bg-white px-3 py-2 text-sm text-slate-900 outline-none focus:border-slate-400"
+                          />
+                        </label>
+                        <label className="block">
+                          <span className="text-xs font-medium text-slate-600">OJT Title</span>
+                          <input
+                            value={editOjtTitle}
+                            onChange={(e) => {
+                              setEditOjtTitle(e.target.value);
+                              setProfileEditError("");
+                              setProfileEditSuccess("");
+                            }}
+                            className="mt-1 w-full rounded-md border border-slate-200 bg-white px-3 py-2 text-sm text-slate-900 outline-none focus:border-slate-400"
+                          />
+                        </label>
+                        <label className="block sm:col-span-2">
+                          <span className="text-xs font-medium text-slate-600">
+                            Required OJT hours
+                          </span>
+                          <input
+                            type="number"
+                            min="0.01"
+                            max="10000"
+                            step="0.01"
+                            aria-label="Required OJT hours"
+                            value={requiredHoursInput}
+                            onChange={(e) => {
+                              setRequiredHoursInput(e.target.value);
+                              setProfileEditError("");
+                              setProfileEditSuccess("");
+                            }}
+                            placeholder="486"
+                            className="mt-1 w-full rounded-md border border-slate-200 bg-white px-3 py-2 text-sm text-slate-900 outline-none focus:border-slate-400"
+                          />
+                        </label>
+                      </div>
+                    </>
+                  )}
+                  <div className="mt-3 flex flex-wrap items-center gap-3 border-t border-slate-200 pt-3">
+                    <div className="mr-auto">
+                      <div className="text-xs font-medium text-slate-600">Account status</div>
+                      <div
+                        className={`text-sm font-semibold ${
+                          selectedTrainee.is_active ? "text-emerald-700" : "text-amber-700"
+                        }`}
+                      >
+                        {selectedTrainee.is_active ? "Active" : "Inactive"}
+                      </div>
+                    </div>
+                    <button
+                      onClick={setAccountActive}
+                      disabled={savingStatus || selectedTrainee.is_admin}
+                      className="rounded-md border border-slate-300 px-3 py-2 text-xs font-semibold text-slate-700 hover:bg-white disabled:cursor-not-allowed disabled:opacity-60"
+                    >
+                      {savingStatus
+                        ? "Saving..."
+                        : selectedTrainee.is_active
+                          ? "Deactivate account"
+                          : "Reactivate account"}
+                    </button>
+                    {statusError && (
+                      <p role="alert" className="basis-full text-xs text-red-600">
+                        {statusError}
+                      </p>
+                    )}
+                    {statusSuccess && (
+                      <p role="status" className="basis-full text-xs text-emerald-700">
+                        {statusSuccess}
+                      </p>
+                    )}
+                  </div>
+                  <div className="mt-3 flex flex-wrap items-center gap-3">
+                    {selectedTrainee.account_type === "ojt" && (
+                      <button
+                        onClick={saveTraineeProfile}
+                        disabled={savingProfile}
+                        className="rounded-md bg-slate-900 px-3 py-2 text-xs font-semibold text-white hover:bg-slate-800 disabled:opacity-60"
+                      >
+                        {savingProfile ? "Saving..." : "Save trainee profile"}
+                      </button>
+                    )}
+                    <button
+                      disabled={
+                        selectedTrainee.is_admin ||
+                        loadingEntries ||
+                        Boolean(entriesError) ||
+                        entries.length > 0 ||
+                        savingProfile ||
+                        savingStatus ||
+                        creatingAccount ||
+                        deletingAccount
+                      }
+                      onClick={() => {
+                        setDeletionTarget(selectedTrainee);
+                        setDeletionConfirmation("");
+                        setDeletionError("");
+                        setDeletionSuccess("");
+                      }}
+                      className="rounded-md border border-red-300 px-3 py-2 text-xs font-semibold text-red-700 disabled:opacity-50"
+                    >
+                      Delete unused account
+                    </button>
+                    {profileEditError && (
+                      <p role="alert" className="text-xs text-red-600">
+                        {profileEditError}
+                      </p>
+                    )}
+                    {profileEditSuccess && (
+                      <p role="status" className="text-xs text-emerald-700">
+                        {profileEditSuccess}
+                      </p>
+                    )}
+                  </div>
+                </div>
+              )}
+            </div>
+            {mutationError && (
+              <div
+                role="alert"
+                aria-live="assertive"
+                className="mb-3 rounded border border-red-200 bg-red-50 p-3 text-xs text-red-700"
+              >
+                <p>{mutationError}</p>
+                {mutationConflict && (
+                  <button
+                    type="button"
+                    onClick={() => window.location.reload()}
+                    className="mt-2 rounded-md border border-red-300 bg-white px-3 py-1.5 font-semibold underline-offset-2 hover:bg-red-100 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-red-700"
+                  >
+                    Reload records
+                  </button>
+                )}
+              </div>
+            )}
+            {selectedTrainee && (
+              <div className="grid grid-cols-2 gap-2 sm:flex sm:flex-wrap sm:items-center">
+                <select
+                  value={docMonth}
+                  onChange={(e) => setDocMonth(Number(e.target.value))}
+                  className="rounded-md border border-slate-200 bg-white px-2 py-1.5 text-xs font-medium text-slate-700 outline-none focus:border-slate-400"
+                  aria-label="Select month to view/print/download"
+                >
+                  {MONTHS.map((m, i) => (
+                    <option key={m} value={i}>
+                      {m}
+                    </option>
+                  ))}
+                </select>
+                <select
+                  value={docYear}
+                  onChange={(e) => setDocYear(Number(e.target.value))}
+                  className="rounded-md border border-slate-200 bg-white px-2 py-1.5 text-xs font-medium text-slate-700 outline-none focus:border-slate-400"
+                  aria-label="Select year to view/print/download"
+                >
+                  {availableYears.map((y) => (
+                    <option key={y} value={y}>
+                      {y}
+                    </option>
+                  ))}
+                </select>
+                <button
+                  onClick={exportSelectedCsv}
+                  className="rounded-md border border-slate-200 px-3 py-1.5 text-xs font-medium text-slate-700 hover:bg-slate-50"
+                >
+                  Export CSV
+                </button>
+                <button
+                  onClick={printSelectedDtr}
+                  className="rounded-md border border-slate-200 px-3 py-1.5 text-xs font-medium text-slate-700 hover:bg-slate-50"
+                >
+                  Print DTR
+                </button>
+                <button
+                  onClick={() => selectedId && setEditor({ userId: selectedId })}
+                  disabled={
+                    !selectedId ||
+                    selectedTrainee.is_admin ||
+                    loadingEntries ||
+                    Boolean(entriesError)
+                  }
+                  className="rounded border px-3 py-2 text-sm"
+                >
+                  Edit DTR
+                </button>
+                <button
+                  onClick={downloadSelectedWordDtr}
+                  className="col-span-2 rounded-md border border-slate-200 px-3 py-1.5 text-xs font-medium text-slate-700 hover:bg-slate-50 sm:col-span-1"
+                >
+                  Download Word
+                </button>
+              </div>
+            )}
+          </div>
+
+          {selectedId && !loadingEntries && !entriesError && (
+            <AttendanceCalendar
+              key={`${selectedId}-${docYear}-${docMonth}`}
+              records={visibleEntries}
+              month={docMonth}
+              year={docYear}
+              today={todayKey()}
+              warning={attendanceWarning}
+            />
+          )}
+          {!selectedId ? (
+            <p className="px-5 py-10 text-center text-sm text-slate-400">
+              Pick an account from the list to view their records.
+            </p>
+          ) : entriesError ? (
+            <p className="px-5 py-10 text-center text-sm text-red-600">
+              Couldn't load attendance records. Reload the page to try again.
+            </p>
+          ) : loadingEntries ? (
+            <AttendanceLoading label="Loading records…" />
+          ) : entries.length === 0 ? (
+            <AttendanceEmpty
+              title="No records for this account yet."
+              description="Saved attendance will appear here once this person checks in."
+            />
+          ) : visibleEntries.length === 0 ? (
+            <AttendanceEmpty
+              title={`No records for ${MONTHS[docMonth]} ${docYear}.`}
+              description="Choose another month to review this account's attendance."
+            />
+          ) : (
+            <>
+              {/* Mobile: card list */}
+              <div className="divide-y divide-slate-100 sm:hidden">
+                {visibleEntries.map((r) => (
+                  <div key={r.id} className="px-4 py-3">
+                    <div className="mb-2 flex items-center justify-between">
+                      <span className="text-sm font-medium text-slate-900">
+                        {fmtDate(r.entry_date)}
+                        <TravelDetails row={r} />
+                      </span>
+                      <div className="flex items-center gap-3">
+                        <span className="font-mono text-xs text-slate-500">
+                          {computeHours(r).toFixed(2)} hrs
+                        </span>
+                        <button
+                          onClick={() => deleteEntry(r.id!)}
+                          className="text-xs font-medium text-red-600 hover:underline"
+                        >
+                          {" "}
+                          Edit DTR{" "}
+                        </button>
+                      </div>
+                    </div>
+                    <div className="grid grid-cols-2 gap-x-3 gap-y-1.5 text-xs text-slate-600">
+                      {ORDER.map((p) => (
+                        <div key={p} className="flex items-center gap-1.5">
+                          <span className="text-slate-400">{LABELS[p]}: </span>
+                          <span className="font-mono">{fmtTime(r[p] as string | null)}</span>
+                          {r[p] && (
+                            <button
+                              onClick={() => clearPunch(r.id!, p)}
+                              title={`Clear ${LABELS[p]}`}
+                              aria-label={`Clear ${LABELS[p]} for ${r.entry_date}`}
+                              className="rounded px-1 text-[10px] font-medium text-slate-400 hover:text-red-600 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-slate-900"
+                            >
+                              ✕
+                            </button>
+                          )}
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                ))}
+              </div>
+
+              {/* Desktop/tablet: table */}
+              <div className="hidden overflow-x-auto sm:block">
+                <table className="w-full text-sm">
+                  <thead className="bg-slate-50 text-left text-xs uppercase tracking-wide text-slate-500">
+                    <tr>
+                      <th className="px-5 py-3 font-medium">Date</th>
+                      <th className="px-5 py-3 font-medium">Check In</th>
+                      <th className="px-5 py-3 font-medium">Break Out</th>
+                      <th className="px-5 py-3 font-medium">Break In</th>
+                      <th className="px-5 py-3 font-medium">Check Out</th>
+                      <th className="px-5 py-3 text-right font-medium">Hours</th>
+                      <th className="px-5 py-3 text-right font-medium">Actions</th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-slate-100">
+                    {visibleEntries.map((r) => (
+                      <tr key={r.id} className="text-slate-700">
+                        <td className="px-5 py-3 font-medium text-slate-900">
+                          {fmtDate(r.entry_date)}
+                          <TravelDetails row={r} />
+                        </td>
+                        {ORDER.map((p) => (
+                          <td key={p} className="px-5 py-3 font-mono">
+                            <div className="flex items-center gap-2">
+                              <span>{fmtTime(r[p] as string | null)}</span>
+                              {r[p] && (
+                                <button
+                                  onClick={() => clearPunch(r.id!, p)}
+                                  title={`Clear ${LABELS[p]}`}
+                                  aria-label={`Clear ${LABELS[p]} for ${r.entry_date}`}
+                                  className="rounded px-1 text-[10px] font-medium text-slate-400 hover:text-red-600 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-slate-900"
+                                >
+                                  ✕
+                                </button>
+                              )}
+                            </div>
+                          </td>
+                        ))}
+                        <td className="px-5 py-3 text-right font-mono">
+                          {computeHours(r).toFixed(2)}
+                        </td>
+                        <td className="px-5 py-3 text-right">
+                          <button
+                            onClick={() => deleteEntry(r.id!)}
+                            className="text-xs font-medium text-red-600 hover:underline"
+                          >
+                            {" "}
+                            Edit DTR{" "}
+                          </button>
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </>
+          )}
+        </div>
+      </fieldset>
+    </AdminWorkspace>
+  );
+}

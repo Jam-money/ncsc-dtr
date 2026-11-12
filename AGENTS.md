@@ -1,0 +1,1 @@
+This is the independent NCSC DTR repository. Do not modify the PSA repository or connect to its production database. Never commit credentials or local test accounts. Preserve audit history and server-side authorization.

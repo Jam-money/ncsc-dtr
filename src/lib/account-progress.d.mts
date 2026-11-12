@@ -1,0 +1,38 @@
+import type { AttendanceRecord } from "./ojt-progress.mjs";
+import type { Enums } from "../integrations/supabase/types";
+export const accountLabels: Record<Enums<"account_type">, string>;
+export const supportedAccountLabels: Pick<
+  typeof accountLabels,
+  "ojt" | "job_order" | "regular_employee"
+>;
+export type ProcessingContract = {
+  id: string;
+  start_date: string;
+  end_date: string | null;
+  required_workdays: number;
+  revision: number;
+};
+export function currentProcessingContract(
+  contracts: ProcessingContract[],
+  date?: string,
+): ProcessingContract | null;
+export type ProgressProfile = {
+  processing_contracts?: ProcessingContract[];
+  account_type: Enums<"account_type">;
+  required_ojt_hours: number | null;
+  required_workdays: number | null;
+};
+export type DatedAttendance = AttendanceRecord & { entry_date: string };
+export function completedWorkdays(records: DatedAttendance[]): number;
+export function accountProgress(
+  profile: ProgressProfile,
+  records: DatedAttendance[],
+): {
+  hours: number;
+  days: number;
+  unit: "hours" | "days" | null;
+  target: number | null;
+  credited: number | null;
+  percentage: number | null;
+  remaining: number | null;
+};

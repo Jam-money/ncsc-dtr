@@ -1,0 +1,51 @@
+import { execFileSync } from "node:child_process";
+import { createClient } from "@supabase/supabase-js";
+
+export function localSupabase() {
+  // Fixed CLI command; never read hosted credentials from .env.
+  const command = process.platform === "win32" ? "cmd.exe" : "npx";
+  const args =
+    process.platform === "win32"
+      ? ["/d", "/s", "/c", "npx --yes supabase status -o json"]
+      : ["--yes", "supabase", "status", "-o", "json"];
+  const status = JSON.parse(
+    execFileSync(command, args, {
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "pipe"],
+      // Optional isolated local stack when another project owns default ports.
+      // The returned API and DB URLs must still pass the loopback guards below.
+      cwd: process.env.DTR_LOCAL_WORKDIR || process.cwd(),
+    }),
+  );
+  const url = new URL(status.API_URL);
+  if (url.protocol !== "http:" || !["localhost", "127.0.0.1"].includes(url.hostname)) {
+    throw new Error("Refusing to seed or test a non-local Supabase database.");
+  }
+  const databaseUrl = new URL(status.DB_URL);
+  if (url.port !== "56321" || databaseUrl.port !== "56322") {
+    throw new Error(
+      "NCSC local tests require the isolated ports 56321/56322. Refusing another project's stack.",
+    );
+  }
+  if (
+    !["postgres:", "postgresql:"].includes(databaseUrl.protocol) ||
+    !["localhost", "127.0.0.1"].includes(databaseUrl.hostname)
+  ) {
+    throw new Error("Refusing a non-local PostgreSQL connection.");
+  }
+  const options = { auth: { persistSession: false, autoRefreshToken: false } };
+  return {
+    databaseUrl: status.DB_URL,
+    mailpitUrl: status.MAILPIT_URL || status.INBUCKET_URL,
+    url: status.API_URL,
+    publicKey: status.ANON_KEY || status.PUBLISHABLE_KEY,
+    serviceRoleKey: status.SERVICE_ROLE_KEY || status.SECRET_KEY,
+    admin: createClient(status.API_URL, status.SERVICE_ROLE_KEY || status.SECRET_KEY, options),
+    client: () => createClient(status.API_URL, status.ANON_KEY || status.PUBLISHABLE_KEY, options),
+  };
+}
+
+export function checked(result) {
+  if (result.error) throw new Error(result.error.message);
+  return result.data;
+}

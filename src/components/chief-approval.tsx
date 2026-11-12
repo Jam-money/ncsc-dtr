@@ -1,0 +1,593 @@
+﻿import { useEffect, useRef, useState } from "react";
+import { useServerFn } from "@tanstack/react-start";
+import { CheckCircle2, Eye, EyeOff, KeyRound, RotateCcw, ShieldCheck } from "lucide-react";
+import { prepareChiefAction, approveChiefAction } from "@/lib/chief-approval.functions";
+import type { ChiefRequest, ChiefResponse, PunchValues } from "@/lib/chief-input";
+import { cn } from "@/lib/utils";
+import {
+  AlertDialog,
+  AlertDialogContent,
+  AlertDialogHeader,
+  AlertDialogTitle,
+  AlertDialogDescription,
+} from "@/components/ui/alert-dialog";
+
+const inputClass =
+  "mt-1 min-h-11 w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-slate-900 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-blue-700 disabled:bg-slate-50";
+const buttonClass =
+  "inline-flex min-h-11 items-center justify-center gap-2 rounded-lg border border-slate-300 bg-white px-4 py-2 text-sm font-semibold text-slate-700 shadow-sm hover:bg-slate-50 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-blue-700 disabled:cursor-not-allowed disabled:opacity-50";
+const fields = ["check_in", "break_out", "break_in", "check_out"] as const;
+const labels = {
+  check_in: "Check In",
+  break_out: "Break Out",
+  break_in: "Break In",
+  check_out: "Check Out",
+};
+export type EditableDtr = PunchValues & { id?: string; entry_date: string };
+
+export function ChiefApproval({
+  request,
+  onClose,
+  onComplete,
+}: {
+  request: ChiefRequest;
+  onClose: () => void;
+  onComplete: (result: ChiefResponse) => void;
+}) {
+  const prepare = useServerFn(prepareChiefAction);
+  const approve = useServerFn(approveChiefAction);
+  const [prepared, setPrepared] = useState<ChiefResponse | null>(null);
+  const [credential, setCredential] = useState("");
+  const [newPassword, setNewPassword] = useState("");
+  const [confirmPassword, setConfirmPassword] = useState("");
+  const [show, setShow] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+  const lock = useRef(false);
+  const settings = request.operation === "change_ssp" || request.operation === "recover_ssp";
+  const clear = () => {
+    setCredential("");
+    setNewPassword("");
+    setConfirmPassword("");
+    setShow(false);
+  };
+  useEffect(() => {
+    let active = true;
+    prepare({ data: request })
+      .then((result) => {
+        if (!active) return;
+        if (result.error) setError(result.error);
+        else setPrepared(result);
+      })
+      .catch(() => {
+        if (active) setError("Approval request could not be prepared. Close and try again.");
+      });
+    return () => {
+      active = false;
+    };
+  }, [prepare, request]);
+  const close = () => {
+    if (lock.current) return;
+    clear();
+    onClose();
+  };
+  const submit = async () => {
+    if (lock.current || !prepared || !credential) return;
+    if (settings && (newPassword.length < 12 || newPassword !== confirmPassword)) {
+      clear();
+      setError("New passwords must match and contain at least 12 characters.");
+      return;
+    }
+    lock.current = true;
+    setBusy(true);
+    setError("");
+    const data = {
+      requestId: request.requestId,
+      credential,
+      ...(settings ? { newPassword, confirmPassword } : {}),
+    };
+    clear();
+    try {
+      const result = await approve({ data });
+      if (result.error) setError(result.error);
+      else onComplete(result);
+    } catch {
+      setError(
+        "The response was not confirmed. Reload records before retrying; the action may have completed.",
+      );
+    } finally {
+      lock.current = false;
+      setBusy(false);
+    }
+  };
+  return (
+    <AlertDialog
+      open
+      onOpenChange={(open) => {
+        if (!open) close();
+      }}
+    >
+      <AlertDialogContent
+        className="max-h-[90vh] overflow-y-auto rounded-2xl border-slate-200"
+        data-chief-prepare-endpoint={prepareChiefAction.url}
+        data-chief-approve-endpoint={approveChiefAction.url}
+      >
+        <AlertDialogHeader>
+          <AlertDialogTitle className="flex items-center gap-2 text-blue-950">
+            <ShieldCheck aria-hidden="true" className="h-5 w-5" />
+            Approval Needed
+          </AlertDialogTitle>
+          <AlertDialogDescription>
+            {request.operation === "recover_ssp"
+              ? "Ask the Chief or authorized custodian to enter the recovery code. The current password cannot be displayed."
+              : "This action requires approval from the Chief. Please ask the Chief to enter the Chief Approval Password."}
+          </AlertDialogDescription>
+        </AlertDialogHeader>
+        {prepared?.account && (
+          <dl className="grid grid-cols-[auto_1fr] gap-x-4 gap-y-2 rounded-xl border border-slate-200 bg-slate-50 p-4 text-sm [&_dt]:text-slate-500 [&_dd]:min-w-0 [&_dd]:break-words [&_dd]:font-medium">
+            <dt>Employee</dt>
+            <dd>{prepared.account.name}</dd>
+            <dt>Email</dt>
+            <dd>{prepared.account.email}</dd>
+            <dt>Account type</dt>
+            <dd>{prepared.account.account_type}</dd>
+            <dt>Position</dt>
+            <dd>{prepared.account.position || "Not provided"}</dd>
+          </dl>
+        )}
+        {request.operation === "edit_dtr" && request.payload.values.travel_hours != null && (
+          <div className="rounded-lg bg-blue-50 p-3 text-sm">
+            <p>
+              Travel correction: {request.payload.date}, {request.payload.values.travel_hours} hours
+            </p>
+            <p>Place: {request.payload.values.travel_place}</p>
+            <p>Travel reason: {request.payload.values.travel_reason}</p>
+            <p>Correction reason: {request.payload.reason}</p>
+          </div>
+        )}
+        {request.operation === "delete_account" && (
+          <p className="text-sm text-red-700">
+            Permanent deletion cannot be undone. Accounts with historical records must be
+            deactivated instead.
+          </p>
+        )}
+        <label>
+          {request.operation === "recover_ssp" ? "Recovery code" : "Chief Approval Password"}
+          <input
+            className={inputClass}
+            type={show ? "text" : "password"}
+            value={credential}
+            onChange={(e) => setCredential(e.target.value)}
+            autoComplete="off"
+            autoCapitalize={request.operation === "recover_ssp" ? "characters" : "none"}
+            spellCheck={false}
+            aria-describedby={
+              request.operation === "recover_ssp" ? "recovery-code-help" : undefined
+            }
+            maxLength={72}
+            disabled={busy}
+          />
+        </label>
+        {request.operation === "recover_ssp" && (
+          <p id="recovery-code-help" className="text-xs text-slate-500">
+            New codes contain 12 letters. Capitalization, spaces and hyphens do not matter. Older
+            recovery codes still work when entered exactly as issued.
+          </p>
+        )}
+        <button
+          type="button"
+          className={cn(
+            buttonClass,
+            show && "border-blue-700 bg-blue-950 text-white hover:bg-blue-900",
+          )}
+          aria-pressed={show}
+          onClick={() => setShow(!show)}
+          disabled={busy}
+        >
+          {show ? (
+            <EyeOff aria-hidden="true" className="h-4 w-4" />
+          ) : (
+            <Eye aria-hidden="true" className="h-4 w-4" />
+          )}
+          {show ? "Hide password" : "Show password"}
+        </button>
+        <p
+          className={`text-xs ${show ? "font-semibold text-blue-800" : "text-slate-500"}`}
+          aria-live="polite"
+        >
+          {show
+            ? "Visibility on — the approval credential is visible."
+            : "Visibility off — the approval credential is hidden."}
+        </p>
+        {settings && (
+          <>
+            <label>
+              New Chief Approval Password
+              <input
+                className={inputClass}
+                type="password"
+                autoComplete="new-password"
+                value={newPassword}
+                onChange={(e) => setNewPassword(e.target.value)}
+                maxLength={72}
+                disabled={busy}
+              />
+            </label>
+            <label>
+              Confirm New Password
+              <input
+                className={inputClass}
+                type="password"
+                autoComplete="new-password"
+                value={confirmPassword}
+                onChange={(e) => setConfirmPassword(e.target.value)}
+                maxLength={72}
+                disabled={busy}
+              />
+            </label>
+          </>
+        )}
+        {error && (
+          <p role="alert" className="text-sm text-red-700">
+            {error}
+          </p>
+        )}
+        {!prepared && !error && <p role="status">Checking approval request…</p>}
+        <div className="flex flex-wrap justify-end gap-2 border-t border-slate-200 pt-4">
+          <button className={buttonClass} onClick={close} disabled={busy}>
+            Cancel
+          </button>
+          <button
+            className={cn(
+              buttonClass,
+              request.operation === "delete_account"
+                ? "border-red-700 bg-red-700 text-white hover:bg-red-800"
+                : "border-blue-950 bg-blue-950 text-white hover:bg-blue-900",
+            )}
+            onClick={submit}
+            disabled={busy || !prepared || !credential || (settings && !newPassword)}
+          >
+            {busy
+              ? "Saving…"
+              : request.operation === "delete_account"
+                ? "Approve and Delete"
+                : "Approve and Save"}
+          </button>
+        </div>
+      </AlertDialogContent>
+    </AlertDialog>
+  );
+}
+
+function localTime(stamp: string | null) {
+  if (!stamp) return "";
+  return new Date(Date.parse(stamp) + 8 * 3600000).toISOString().slice(11, 19);
+}
+export function DtrEditor({
+  userId,
+  allowTravel = false,
+  rows,
+  initial,
+  onClose,
+  onSaved,
+}: {
+  userId: string;
+  allowTravel?: boolean;
+  rows: EditableDtr[];
+  initial?: EditableDtr;
+  onClose: () => void;
+  onSaved: () => void;
+}) {
+  const [date, setDate] = useState(initial?.entry_date || "");
+  const original = rows.find((row) => row.entry_date === date);
+  const [values, setValues] = useState<Record<keyof PunchValues, string>>(
+    () =>
+      Object.fromEntries(fields.map((f) => [f, localTime(initial?.[f] ?? null)])) as Record<
+        keyof PunchValues,
+        string
+      >,
+  );
+  const [travel, setTravel] = useState(initial?.travel_hours != null);
+  const [travelHours, setTravelHours] = useState(String(initial?.travel_hours ?? 8));
+  const [travelPlace, setTravelPlace] = useState(initial?.travel_place ?? "");
+  const [travelReason, setTravelReason] = useState(initial?.travel_reason ?? "");
+  const [reason, setReason] = useState("");
+  const [request, setRequest] = useState<ChiefRequest | null>(null);
+  const [error, setError] = useState("");
+  const selectDate = (value: string) => {
+    setDate(value);
+    const row = rows.find((r) => r.entry_date === value);
+    setTravel(row?.travel_hours != null);
+    setTravelHours(String(row?.travel_hours ?? 8));
+    setTravelPlace(row?.travel_place ?? "");
+    setTravelReason(row?.travel_reason ?? "");
+    setValues(
+      Object.fromEntries(fields.map((f) => [f, localTime(row?.[f] ?? null)])) as typeof values,
+    );
+  };
+  const save = () => {
+    if (!date || reason.trim().length < 3) {
+      setError("Select a date and enter a correction reason of at least 3 characters.");
+      return;
+    }
+    if (travel && (!travelPlace.trim() || travelPlace.trim().length > 15 || !travelReason.trim())) {
+      setError("Enter a travel place and reason.");
+      return;
+    }
+    const stamps = Object.fromEntries(
+      fields.map((f) => [
+        f,
+        travel
+          ? null
+          : values[f] === localTime(original?.[f] ?? null)
+            ? (original?.[f] ?? null)
+            : values[f]
+              ? new Date(`${date}T${values[f]}+08:00`).toISOString()
+              : null,
+      ]),
+    ) as PunchValues;
+    setRequest({
+      requestId: crypto.randomUUID(),
+      operation: "edit_dtr",
+      payload: {
+        targetUserId: userId,
+        date,
+        reason: reason.trim(),
+        expected: original?.id
+          ? {
+              id: original.id,
+              travel_hours: original.travel_hours ?? null,
+              travel_place: original.travel_place ?? null,
+              travel_reason: original.travel_reason ?? null,
+              ...(Object.fromEntries(fields.map((f) => [f, original[f]])) as PunchValues),
+            }
+          : null,
+        values: {
+          ...stamps,
+          travel_hours: travel ? Number(travelHours) : null,
+          travel_place: travel ? travelPlace.trim() : null,
+          travel_reason: travel ? travelReason.trim() : null,
+        },
+      },
+    });
+  };
+  if (request)
+    return (
+      <ChiefApproval
+        request={request}
+        onClose={() => setRequest(null)}
+        onComplete={() => {
+          onSaved();
+          onClose();
+        }}
+      />
+    );
+  return (
+    <AlertDialog
+      open
+      onOpenChange={(open) => {
+        if (!open) onClose();
+      }}
+    >
+      <AlertDialogContent className="max-h-[90vh] overflow-y-auto">
+        <AlertDialogHeader>
+          <AlertDialogTitle>Edit DTR</AlertDialogTitle>
+          <AlertDialogDescription>
+            Review the original and corrected punches in Philippine time. Changes require a reason
+            and Chief approval. Clearing punches preserves the record and its audit history.
+          </AlertDialogDescription>
+        </AlertDialogHeader>
+        <label>
+          Attendance date
+          <input
+            type="date"
+            className={inputClass}
+            value={date}
+            onChange={(e) => selectDate(e.target.value)}
+          />
+        </label>
+        {allowTravel && (
+          <label>
+            Attendance type
+            <select
+              aria-label="Attendance type"
+              className={inputClass}
+              value={travel ? "travel" : "punches"}
+              onChange={(e) => setTravel(e.target.value === "travel")}
+            >
+              <option value="punches">Normal punches</option>
+              <option value="travel">Travel</option>
+            </select>
+          </label>
+        )}
+        {travel && (
+          <div className="space-y-3">
+            <label className="block">
+              Travel hours
+              <select
+                aria-label="Travel hours"
+                className={inputClass}
+                value={travelHours}
+                onChange={(e) => setTravelHours(e.target.value)}
+              >
+                <option value="8">8 hours</option>
+                <option value="10">10 hours</option>
+              </select>
+            </label>
+            <label className="block">
+              Place of travel
+              <input
+                className={inputClass}
+                maxLength={15}
+                value={travelPlace}
+                onChange={(e) => setTravelPlace(e.target.value)}
+              />
+            </label>
+            <label className="block">
+              Reason for travel
+              <textarea
+                className={inputClass}
+                maxLength={1000}
+                value={travelReason}
+                onChange={(e) => setTravelReason(e.target.value)}
+              />
+            </label>
+            <p className="text-xs">
+              Original travel: {original?.travel_hours ?? "None"} hours; {original?.travel_place};{" "}
+              {original?.travel_reason}
+            </p>
+          </div>
+        )}
+        {!travel &&
+          fields.map((f) => (
+            <label key={f}>
+              {labels[f]}
+              <span className="block text-xs">
+                Original: {localTime(original?.[f] ?? null) || "Not recorded"}
+              </span>
+              <input
+                type="time"
+                aria-label={labels[f]}
+                step="1"
+                className={inputClass}
+                value={values[f]}
+                onChange={(e) => setValues((v) => ({ ...v, [f]: e.target.value }))}
+              />
+            </label>
+          ))}
+        <label>
+          Correction reason
+          <textarea
+            aria-label="Correction reason"
+            className={inputClass}
+            value={reason}
+            maxLength={1000}
+            onChange={(e) => setReason(e.target.value)}
+          />
+        </label>
+        {error && <p role="alert">{error}</p>}
+        <div className="flex gap-2">
+          <button className={buttonClass} onClick={onClose}>
+            Cancel
+          </button>
+          <button
+            className={cn(buttonClass, "border-blue-950 bg-blue-950 text-white hover:bg-blue-900")}
+            onClick={save}
+            disabled={!date || reason.trim().length < 3}
+          >
+            Save Changes
+          </button>
+        </div>
+      </AlertDialogContent>
+    </AlertDialog>
+  );
+}
+
+export function ChiefSettings() {
+  const [request, setRequest] = useState<ChiefRequest | null>(null);
+  const [message, setMessage] = useState("");
+  const [recoveryCode, setRecoveryCode] = useState("");
+  return (
+    <section
+      aria-label="Chief approval settings"
+      className="min-w-0 overflow-hidden rounded-2xl border border-slate-200 bg-white shadow-sm"
+    >
+      <header className="flex items-start gap-3 border-b border-slate-200 px-4 py-5 sm:gap-4 sm:px-6">
+        <div className="flex size-11 shrink-0 items-center justify-center rounded-xl bg-blue-950 text-white">
+          <ShieldCheck className="size-5" aria-hidden="true" />
+        </div>
+        <div className="min-w-0">
+          <h2
+            id="chief-settings-title"
+            className="text-lg font-semibold tracking-tight text-slate-950"
+          >
+            Chief Approval Password
+          </h2>
+          <p className="mt-1 text-sm leading-relaxed text-slate-600">
+            Used for Chief-approved DTR corrections and unused-account deletion.
+          </p>
+        </div>
+      </header>
+      <div className="grid gap-4 p-4 sm:grid-cols-2 sm:p-6">
+        {(
+          [
+            [
+              "change_ssp",
+              "Change Password",
+              "Update the approval password",
+              "The Chief enters the current approval password and chooses a new one.",
+              KeyRound,
+            ],
+            [
+              "recover_ssp",
+              "Forgot Approval Password",
+              "Recover approval access",
+              "Ask the Chief or authorized custodian for the separate recovery code.",
+              RotateCcw,
+            ],
+          ] as const
+        ).map(([operation, label, title, description, Icon]) => (
+          <div
+            key={operation}
+            className="flex min-w-0 flex-col rounded-xl border border-slate-200 bg-slate-50/60 p-4 sm:p-5"
+          >
+            <div className="mb-2 flex items-center gap-2 text-slate-800">
+              <Icon className="size-4 shrink-0 text-slate-500" aria-hidden="true" />
+              <h3 className="text-sm font-semibold">{title}</h3>
+            </div>
+            <p className="mb-4 flex-1 text-sm leading-relaxed text-slate-600">{description}</p>
+            <button
+              className="inline-flex min-h-11 items-center justify-center rounded-lg border border-slate-300 bg-white px-4 py-2.5 text-sm font-semibold text-slate-700 shadow-sm transition-colors hover:border-blue-300 hover:bg-blue-50 hover:text-blue-950 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-blue-700 sm:self-start"
+              onClick={() => {
+                setRecoveryCode("");
+                setMessage("");
+                setRequest({ requestId: crypto.randomUUID(), operation, payload: {} });
+              }}
+            >
+              {label}
+            </button>
+          </div>
+        ))}
+      </div>
+      {message && (
+        <p
+          role="status"
+          className="mx-4 mb-4 flex items-start gap-2 rounded-xl border border-emerald-200 bg-emerald-50 p-4 text-sm leading-relaxed text-emerald-900 sm:mx-6 sm:mb-6"
+        >
+          <CheckCircle2 className="mt-0.5 size-4 shrink-0" aria-hidden="true" />
+          {message}
+        </p>
+      )}
+      {recoveryCode && (
+        <div
+          role="status"
+          className="mx-4 mb-4 space-y-3 rounded-xl border border-amber-300 bg-amber-50 p-4 sm:mx-6 sm:mb-6 sm:p-5"
+        >
+          <p className="text-sm font-semibold text-amber-950">
+            Store this new recovery code securely. It is shown only once:
+          </p>
+          <code className="block select-all break-all rounded-lg border border-amber-200 bg-white p-3 text-sm leading-relaxed text-slate-900">
+            {recoveryCode}
+          </code>
+          <button
+            className="min-h-11 w-full rounded-lg bg-slate-900 px-4 py-2.5 text-sm font-semibold text-white hover:bg-slate-800 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-blue-700 sm:w-auto"
+            onClick={() => setRecoveryCode("")}
+          >
+            I have stored the code
+          </button>
+        </div>
+      )}
+      {request && (
+        <ChiefApproval
+          request={request}
+          onClose={() => setRequest(null)}
+          onComplete={(result) => {
+            setRequest(null);
+            setMessage("Chief Approval Password updated. The previous password no longer works.");
+            setRecoveryCode(result.recoveryCode || "");
+          }}
+        />
+      )}
+    </section>
+  );
+}
